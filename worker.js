@@ -7,6 +7,8 @@ const BOT_OWNER = 123456789; // Insert your telegram account id.
 const BOT_CHANNEL = -100123456789; // Insert your telegram channel id which the bot is admin in.
 const SIA_SECRET = "SIA_SECRET"; // Insert a powerful secret text and keep it safe.
 const PUBLIC_BOT = false; // Make your bot public (only [true, false] are allowed).
+const OWNER_USERNAME = "FLiX_LY"; // Insert your telegram username for credits.
+const BOT_NAME = "FileStream Bot"; // Insert your bot display name.
 
 
 // ---------- Do Not Modify ---------- // 
@@ -765,4 +767,4 @@ async function onMessage(event, message) {
     } catch (error) {
         return Bot.sendMessage(message.chat.id, message.message_id, "❌ **Critical Error:**\n" + error.message);
     }
-}}
+}}}
