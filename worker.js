@@ -11,7 +11,7 @@ const OWNER_USERNAME = "FLiX_LY"; // Insert your telegram username for credits.
 const BOT_NAME = "FileStream Bot"; // Insert your bot display name.
 const RATE_LIMIT_REQUESTS = 30; // Max requests per minute per user.
 const MAX_FILE_SIZE = 4294967296; // 4GB in bytes.
-const MONGODB_URI = "mongodb+srv://flixly:Flix1232@flixop.kldgd4t.mongodb.net/?retryWrites=true&w=majority&appName=FLIXOP"; // Insert your MongoDB connection string (e.g., mongodb+srv://username:password@cluster.mongodb.net/filestream)
+const MONGODB_URI = "retryWrites=true&w=majority&appName=FLIXOP"; // Insert your MongoDB connection string (e.g., mongodb+srv://username:password@cluster.mongodb.net/filestream)
 const MONGODB_DATABASE = "filestream"; // MongoDB database name.
 const MONGODB_COLLECTION = "files"; // MongoDB collection name for storing file metadata.
 const MONGODB_USERS_COLLECTION = "users"; // MongoDB collection name for storing user data.
