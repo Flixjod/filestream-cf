@@ -21,6 +21,10 @@ const ERROR_405 = {"ok":false,"error_code":405,"description":"Bad Request: metho
 const ERROR_406 = {"ok":false,"error_code":406,"description":"Bad Request: file type invalid"};
 const ERROR_407 = {"ok":false,"error_code":407,"description":"Bad Request: file hash invalid by atob"};
 const ERROR_408 = {"ok":false,"error_code":408,"description":"Bad Request: mode not in [attachment, inline]"};
+const ERROR_410 = {"ok":false,"error_code":410,"description":"File has been revoked"};
+
+// Global DB variable
+let DB_INSTANCE = null;
 
 // ---------- Event Listener ---------- // 
 
@@ -32,7 +36,9 @@ async function handleRequest(event) {
     const url = new URL(event.request.url);
     const file = url.searchParams.get('file');
     const mode = url.searchParams.get('mode') || "attachment";
-    const d = url.searchParams.get('d'); 
+    
+    // Set DB instance from environment
+    DB_INSTANCE = event.env?.DB || null;
      
     if (url.pathname === BOT_WEBHOOK) {return Bot.handleWebhook(event)}
     if (url.pathname === '/registerWebhook') {return Bot.registerWebhook(event, url, BOT_WEBHOOK, BOT_SECRET)}
@@ -41,13 +47,36 @@ async function handleRequest(event) {
     if (url.pathname === '/') {return new Response(await getHomePage(), {headers: {'Content-Type': 'text/html'}})}
     if (url.pathname === '/stream' && file) {return new Response(await getStreamPage(url, file), {headers: {'Content-Type': 'text/html'}})}
 
+    // New path-based routing
+    const pathMatch = url.pathname.match(/^\/(dl|stream)\/([A-Z2-7]+)$/);
+    if (pathMatch) {
+        const [, routeMode, fileHash] = pathMatch;
+        const finalMode = routeMode === 'stream' ? 'inline' : 'attachment';
+        return handleFileRequest(event, fileHash, finalMode);
+    }
+
     if (!file) {return Raise(ERROR_404, 404);}
+    return handleFileRequest(event, file, mode);
+}
+
+async function handleFileRequest(event, fileHash, mode) {
     if (!["attachment", "inline", "stream"].includes(mode)) {return Raise(ERROR_408, 404)}
     if (!WHITE_METHODS.includes(event.request.method)) {return Raise(ERROR_405, 405);}
-    try {await Cryptic.deHash(file)} catch {return Raise(ERROR_407, 404)}
+    
+    try {await Cryptic.deHash(fileHash)} catch {return Raise(ERROR_407, 404)}
+
+    // Check if file is revoked
+    if (DB_INSTANCE) {
+        const isRevoked = await DB.isFileRevoked(fileHash);
+        if (isRevoked) {
+            return Raise(ERROR_410, 410);
+        }
+        // Increment download count
+        await DB.incrementDownloads(fileHash);
+    }
 
     const channel_id = BOT_CHANNEL;
-    const file_id = await Cryptic.deHash(file);
+    const file_id = await Cryptic.deHash(fileHash);
     const retrieve = await RetrieveFile(channel_id, file_id);
     if (retrieve.error_code) {return await Raise(retrieve, retrieve.error_code)};
 
@@ -152,12 +181,22 @@ function formatSize(bytes) {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
+// ---------- Generate Revoke Token ---------- //
+function generateRevokeToken(length = 16) {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    let token = '';
+    for (let i = 0; i < length; i++) {
+        token += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return token;
+}
+
 // ---------- Stream Page Generator ---------- //
 
 async function getStreamPage(url, fileHash) {
     const bot = await Bot.getMe();
-    const streamUrl = `${url.origin}/?file=${fileHash}&mode=inline`;
-    const downloadUrl = `${url.origin}/?file=${fileHash}`;
+    const streamUrl = `${url.origin}/stream/${fileHash}`;
+    const downloadUrl = `${url.origin}/dl/${fileHash}`;
     const telegramUrl = `https://t.me/${bot.username}/?start=${fileHash}`;
      
     // Get file info
@@ -484,6 +523,192 @@ class Cryptic {
   }
 }
 
+// ---------- Database Class ---------- //
+
+class DB {
+  static async registerUser(userId, firstName, username = null) {
+    if (!DB_INSTANCE) return false;
+    try {
+      const timestamp = Date.now();
+      await DB_INSTANCE.prepare(
+        'INSERT OR IGNORE INTO users (user_id, first_name, username, registered_at) VALUES (?, ?, ?, ?)'
+      ).bind(userId, firstName, username, timestamp).run();
+      return true;
+    } catch (e) {
+      console.error('Error registering user:', e);
+      return false;
+    }
+  }
+
+  static async saveFile(fileHash, messageId, userId, userName, fileName, fileSize, fileType, revokeToken) {
+    if (!DB_INSTANCE) return false;
+    try {
+      const timestamp = Date.now();
+      await DB_INSTANCE.prepare(
+        'INSERT INTO files (file_hash, message_id, user_id, user_name, file_name, file_size, file_type, created_at, revoke_token) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      ).bind(fileHash, messageId, userId, userName, fileName, fileSize, fileType, timestamp, revokeToken).run();
+      
+      // Update user's total files count
+      await DB_INSTANCE.prepare(
+        'UPDATE users SET total_files = total_files + 1 WHERE user_id = ?'
+      ).bind(userId).run();
+      
+      return true;
+    } catch (e) {
+      console.error('Error saving file:', e);
+      return false;
+    }
+  }
+
+  static async getFile(fileHash) {
+    if (!DB_INSTANCE) return null;
+    try {
+      const result = await DB_INSTANCE.prepare(
+        'SELECT * FROM files WHERE file_hash = ?'
+      ).bind(fileHash).first();
+      return result;
+    } catch (e) {
+      console.error('Error getting file:', e);
+      return null;
+    }
+  }
+
+  static async getUserFiles(userId, limit = 50) {
+    if (!DB_INSTANCE) return [];
+    try {
+      const result = await DB_INSTANCE.prepare(
+        'SELECT * FROM files WHERE user_id = ? AND revoked = 0 ORDER BY created_at DESC LIMIT ?'
+      ).bind(userId, limit).all();
+      return result.results || [];
+    } catch (e) {
+      console.error('Error getting user files:', e);
+      return [];
+    }
+  }
+
+  static async revokeFile(fileHash, revokeToken = null, isOwner = false) {
+    if (!DB_INSTANCE) return { success: false, message: 'Database not available' };
+    try {
+      const file = await this.getFile(fileHash);
+      if (!file) {
+        return { success: false, message: 'File not found' };
+      }
+      
+      if (file.revoked === 1) {
+        return { success: false, message: 'File already revoked' };
+      }
+      
+      // Check revoke token if not owner
+      if (!isOwner && file.revoke_token !== revokeToken) {
+        return { success: false, message: 'Invalid revoke token' };
+      }
+      
+      const timestamp = Date.now();
+      await DB_INSTANCE.prepare(
+        'UPDATE files SET revoked = 1, revoked_at = ? WHERE file_hash = ?'
+      ).bind(timestamp, fileHash).run();
+      
+      // Delete from channel
+      try {
+        await Bot.deleteMessage(BOT_CHANNEL, file.message_id);
+      } catch (e) {
+        console.error('Error deleting message from channel:', e);
+      }
+      
+      return { success: true, message: 'File revoked successfully', file };
+    } catch (e) {
+      console.error('Error revoking file:', e);
+      return { success: false, message: 'Error revoking file' };
+    }
+  }
+
+  static async revokeAllFiles() {
+    if (!DB_INSTANCE) return { success: false, message: 'Database not available' };
+    try {
+      // Get all non-revoked files
+      const files = await DB_INSTANCE.prepare(
+        'SELECT message_id FROM files WHERE revoked = 0'
+      ).all();
+      
+      const timestamp = Date.now();
+      
+      // Mark all as revoked
+      await DB_INSTANCE.prepare(
+        'UPDATE files SET revoked = 1, revoked_at = ? WHERE revoked = 0'
+      ).bind(timestamp).run();
+      
+      // Delete from channel
+      let deleted = 0;
+      for (const file of files.results || []) {
+        try {
+          await Bot.deleteMessage(BOT_CHANNEL, file.message_id);
+          deleted++;
+        } catch (e) {
+          console.error('Error deleting message:', e);
+        }
+      }
+      
+      return { success: true, message: `Revoked ${files.results?.length || 0} files, deleted ${deleted} from channel` };
+    } catch (e) {
+      console.error('Error revoking all files:', e);
+      return { success: false, message: 'Error revoking files' };
+    }
+  }
+
+  static async isFileRevoked(fileHash) {
+    if (!DB_INSTANCE) return false;
+    try {
+      const file = await this.getFile(fileHash);
+      return file ? file.revoked === 1 : false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  static async incrementDownloads(fileHash) {
+    if (!DB_INSTANCE) return false;
+    try {
+      const file = await this.getFile(fileHash);
+      if (!file) return false;
+      
+      await DB_INSTANCE.prepare(
+        'UPDATE files SET downloads = downloads + 1 WHERE file_hash = ?'
+      ).bind(fileHash).run();
+      
+      // Update user's total downloads
+      await DB_INSTANCE.prepare(
+        'UPDATE users SET total_downloads = total_downloads + 1 WHERE user_id = ?'
+      ).bind(file.user_id).run();
+      
+      return true;
+    } catch (e) {
+      console.error('Error incrementing downloads:', e);
+      return false;
+    }
+  }
+
+  static async getStats(userId) {
+    if (!DB_INSTANCE) return null;
+    try {
+      const user = await DB_INSTANCE.prepare(
+        'SELECT * FROM users WHERE user_id = ?'
+      ).bind(userId).first();
+      
+      const files = await DB_INSTANCE.prepare(
+        'SELECT COUNT(*) as count FROM files WHERE user_id = ? AND revoked = 0'
+      ).bind(userId).first();
+      
+      return {
+        user,
+        active_files: files?.count || 0
+      };
+    } catch (e) {
+      console.error('Error getting stats:', e);
+      return null;
+    }
+  }
+}
+
 // ---------- Telegram Bot ---------- //
 
 class Bot {
@@ -519,6 +744,18 @@ class Bot {
     } else {return await response.json()}
   }
 
+  static async editMessageText(chat_id, message_id, text, reply_markup=[]) {
+    const response = await fetch(await this.apiUrl('editMessageText', {chat_id: chat_id, message_id: message_id, parse_mode: 'markdown', text, reply_markup: JSON.stringify({inline_keyboard: reply_markup})}))
+    if (response.status == 200) {return (await response.json()).result;
+    } else {return await response.json()}
+  }
+
+  static async answerCallbackQuery(callback_query_id, text, show_alert = false) {
+    const response = await fetch(await this.apiUrl('answerCallbackQuery', {callback_query_id, text, show_alert}))
+    if (response.status == 200) {return (await response.json()).result;
+    } else {return await response.json()}
+  }
+
   static async sendDocument(chat_id, file_id) {
     const response = await fetch(await this.apiUrl('sendDocument', {chat_id: chat_id, document: file_id}))
     if (response.status == 200) {return (await response.json()).result;
@@ -535,6 +772,12 @@ class Bot {
       const response = await fetch(await this.apiUrl('editMessageCaption', {chat_id: channel_id, message_id: message_id, caption: caption_text}))
       if (response.status == 200) {return (await response.json()).result;
       } else {return await response.json()}
+  }
+
+  static async deleteMessage(chat_id, message_id) {
+    const response = await fetch(await this.apiUrl('deleteMessage', {chat_id: chat_id, message_id: message_id}))
+    if (response.status == 200) {return (await response.json()).result;
+    } else {return await response.json()}
   }
 
   static async answerInlineArticle(query_id, title, description, text, reply_markup=[], id='1') {
@@ -578,6 +821,101 @@ class Bot {
   static async Update(event, update) {
     if (update.inline_query) {await onInline(event, update.inline_query)}
     if ('message' in update) {await onMessage(event, update.message)}
+    if ('callback_query' in update) {await onCallbackQuery(event, update.callback_query)}
+  }
+}
+
+// ---------- Callback Query Listener ---------- //
+
+async function onCallbackQuery(event, callback) {
+  const data = callback.data;
+  const chatId = callback.message.chat.id;
+  const messageId = callback.message.message_id;
+  const userId = callback.from.id;
+
+  // Handle revoke button
+  if (data.startsWith('revoke:')) {
+    const fileHash = data.split(':')[1];
+    const file = await DB.getFile(fileHash);
+    
+    if (!file) {
+      return Bot.answerCallbackQuery(callback.id, '❌ File not found', true);
+    }
+    
+    // Check if user owns the file or is owner
+    const isOwner = userId === BOT_OWNER;
+    const isFileOwner = userId === file.user_id;
+    
+    if (!isOwner && !isFileOwner) {
+      return Bot.answerCallbackQuery(callback.id, '❌ You are not authorized to revoke this file', true);
+    }
+    
+    const result = await DB.revokeFile(fileHash, null, true);
+    
+    if (result.success) {
+      const newText = `*🗑️ ғɪʟᴇ ʀᴇᴠᴏᴋᴇᴅ*\n\n` +
+                      `📂 *ғɪʟᴇ ɴᴀᴍᴇ:* \`${file.file_name}\`\n` +
+                      `💾 *ғɪʟᴇ sɪᴢᴇ:* \`${formatSize(file.file_size)}\`\n\n` +
+                      `❌ This file has been permanently deleted.`;
+      await Bot.editMessageText(chatId, messageId, newText, []);
+      return Bot.answerCallbackQuery(callback.id, '✅ File revoked successfully', false);
+    } else {
+      return Bot.answerCallbackQuery(callback.id, '❌ ' + result.message, true);
+    }
+  }
+
+  // Handle file list navigation
+  if (data === 'files:list') {
+    const files = await DB.getUserFiles(userId, 10);
+    
+    if (files.length === 0) {
+      return Bot.answerCallbackQuery(callback.id, 'You have no files', true);
+    }
+    
+    const buttons = files.map(file => {
+      const truncated = file.file_name.length > 30 ? 
+        file.file_name.substring(0, 27) + '...' : file.file_name;
+      return [{ text: `📄 ${truncated}`, callback_data: `file:${file.file_hash}` }];
+    });
+    
+    const text = `*📂 ʏᴏᴜʀ ғɪʟᴇs*\n\nSelect a file to view details and manage:`;
+    await Bot.editMessageText(chatId, messageId, text, buttons);
+    return Bot.answerCallbackQuery(callback.id, '', false);
+  }
+
+  // Handle file details view
+  if (data.startsWith('file:')) {
+    const fileHash = data.split(':')[1];
+    const file = await DB.getFile(fileHash);
+    
+    if (!file) {
+      return Bot.answerCallbackQuery(callback.id, 'File not found', true);
+    }
+    
+    const url = new URL(event.request.url);
+    const streamUrl = `${url.origin}/stream/${fileHash}`;
+    const downloadUrl = `${url.origin}/dl/${fileHash}`;
+    const bot = await Bot.getMe();
+    const telegramUrl = `https://t.me/${bot.username}/?start=${fileHash}`;
+    
+    const text = `*📂 ғɪʟᴇ ᴅᴇᴛᴀɪʟs*\n\n` +
+                 `📄 *ɴᴀᴍᴇ:* \`${file.file_name}\`\n` +
+                 `💾 *sɪᴢᴇ:* \`${formatSize(file.file_size)}\`\n` +
+                 `📊 *ᴛʏᴘᴇ:* \`${file.file_type}\`\n` +
+                 `📥 *ᴅᴏᴡɴʟᴏᴀᴅs:* \`${file.downloads}\`\n` +
+                 `🔐 *ғɪʟᴇ ɪᴅ:* \`${file.message_id}\`\n\n` +
+                 `🔗 *sᴛʀᴇᴀᴍ ʟɪɴᴋ:* \`${streamUrl}\``;
+    
+    const buttons = [
+      [{ text: "🌐 Stream Page", url: streamUrl }],
+      [{ text: "📥 Download", url: downloadUrl }],
+      [{ text: "💬 Telegram", url: telegramUrl }],
+      [{ text: "🗑️ Revoke", callback_data: `revoke:${fileHash}` }],
+      [{ text: "« Back", callback_data: "files:list" }]
+    ];
+    
+    await Bot.editMessageText(chatId, messageId, text, buttons);
+    return Bot.answerCallbackQuery(callback.id, '', false);
   }
 }
 
@@ -658,10 +996,13 @@ async function onMessage(event, message) {
 
     // 3. Handle Start Command
     if (message.text && (message.text === "/start" || message.text.startsWith("/start "))) {
+        // Register user
+        await DB.registerUser(message.from.id, message.from.first_name, message.from.username);
+        
         // Plain start
         if (message.text === "/start") {
              const buttons = [[{ text: "👨‍💻 Source Code", url: "https://github.com/vauth/filestream-cf" }]];
-             const startText = `👋 *ʜᴇʟʟᴏ ${message.from.first_name}*,\n\nI am a *ᴘʀᴇᴍɪᴜᴍ ғɪʟᴇ sᴛʀᴇᴀᴍ ʙᴏᴛ*.\n\n📂 *Send me any file* (Video, Audio, Document) and I will generate a direct download and streaming link for you.`;
+             const startText = `👋 *ʜᴇʟʟᴏ ${message.from.first_name}*,\n\nI am a *ᴘʀᴇᴍɪᴜᴍ ғɪʟᴇ sᴛʀᴇᴀᴍ ʙᴏᴛ*.\n\n📂 *Send me any file* (Video, Audio, Document) and I will generate a direct download and streaming link for you.\n\n📝 *Commands:*\n/files - View your uploaded files\n/stats - View your statistics\n/revoke [hash] [token] - Revoke a file`;
              return Bot.sendMessage(message.chat.id, message.message_id, startText, buttons);
         }
 
@@ -692,13 +1033,94 @@ async function onMessage(event, message) {
         }
     }
 
-    // 4. Access Control
+    // 4. Handle /files command
+    if (message.text === "/files") {
+        const files = await DB.getUserFiles(message.from.id, 10);
+        
+        if (files.length === 0) {
+            return Bot.sendMessage(message.chat.id, message.message_id, "*📂 ʏᴏᴜʀ ғɪʟᴇs*\n\nYou haven't uploaded any files yet.");
+        }
+        
+        const buttons = files.map(file => {
+            const truncated = file.file_name.length > 30 ? 
+                file.file_name.substring(0, 27) + '...' : file.file_name;
+            return [{ text: `📄 ${truncated}`, callback_data: `file:${file.file_hash}` }];
+        });
+        
+        const text = `*📂 ʏᴏᴜʀ ғɪʟᴇs*\n\nSelect a file to view details and manage:`;
+        return Bot.sendMessage(message.chat.id, message.message_id, text, buttons);
+    }
+
+    // 5. Handle /stats command
+    if (message.text === "/stats") {
+        const stats = await DB.getStats(message.from.id);
+        if (!stats) {
+            return Bot.sendMessage(message.chat.id, message.message_id, "❌ Unable to fetch statistics");
+        }
+        
+        const text = `*📊 ʏᴏᴜʀ sᴛᴀᴛɪsᴛɪᴄs*\n\n` +
+                     `👤 *ᴜsᴇʀ:* ${message.from.first_name}\n` +
+                     `🆔 *ɪᴅ:* \`${message.from.id}\`\n` +
+                     `📁 *ᴛᴏᴛᴀʟ ғɪʟᴇs:* ${stats.user?.total_files || 0}\n` +
+                     `📂 *ᴀᴄᴛɪᴠᴇ ғɪʟᴇs:* ${stats.active_files}\n` +
+                     `📥 *ᴛᴏᴛᴀʟ ᴅᴏᴡɴʟᴏᴀᴅs:* ${stats.user?.total_downloads || 0}`;
+        
+        return Bot.sendMessage(message.chat.id, message.message_id, text);
+    }
+
+    // 6. Handle /revoke command
+    if (message.text && message.text.startsWith("/revoke")) {
+        const parts = message.text.split(" ");
+        
+        if (parts.length < 2) {
+            return Bot.sendMessage(message.chat.id, message.message_id, 
+                "*📝 Revoke Command Usage:*\n\n" +
+                "For users: `/revoke [file_hash] [revoke_token]`\n" +
+                "For owner: `/revoke [file_hash]`\n\n" +
+                "Example: `/revoke ABCD1234 TOKEN123`");
+        }
+        
+        const fileHash = parts[1];
+        const revokeToken = parts[2] || null;
+        const isOwner = message.from.id === BOT_OWNER;
+        
+        const result = await DB.revokeFile(fileHash, revokeToken, isOwner);
+        
+        if (result.success) {
+            return Bot.sendMessage(message.chat.id, message.message_id, 
+                `✅ *File revoked successfully*\n\n` +
+                `📂 *File:* \`${result.file.file_name}\`\n` +
+                `🗑️ The file has been deleted from the channel and all links are now inactive.`);
+        } else {
+            return Bot.sendMessage(message.chat.id, message.message_id, 
+                `❌ *Error:* ${result.message}`);
+        }
+    }
+
+    // 7. Handle /revokeall command (owner only)
+    if (message.text === "/revokeall") {
+        if (message.from.id !== BOT_OWNER) {
+            return Bot.sendMessage(message.chat.id, message.message_id, "❌ This command is only available to the bot owner");
+        }
+        
+        const result = await DB.revokeAllFiles();
+        
+        if (result.success) {
+            return Bot.sendMessage(message.chat.id, message.message_id, 
+                `✅ *All files revoked*\n\n${result.message}`);
+        } else {
+            return Bot.sendMessage(message.chat.id, message.message_id, 
+                `❌ *Error:* ${result.message}`);
+        }
+    }
+
+    // 8. Access Control
     if (!PUBLIC_BOT && message.chat.id != BOT_OWNER) {
         const buttons = [[{ text: "Source Code", url: "https://github.com/vauth/filestream-cf" }]];
         return Bot.sendMessage(message.chat.id, message.message_id, "*❌ ᴀᴄᴄᴇss ғᴏʀʙɪᴅᴅᴇɴ.*\n📡 Deploy your own [filestream-cf](https://github.com/vauth/filestream-cf) bot.", buttons)
     }
 
-    // 5. Detect File Type
+    // 9. Detect File Type
     if (message.document) {
         fID = message.document.file_id;
         fName = message.document.file_name;
@@ -728,43 +1150,58 @@ async function onMessage(event, message) {
         return Bot.sendMessage(message.chat.id, message.message_id, "Send me any file/video/gif/audio *(t<=4GB, e<=20MB)*.", buttons)
     }
 
-    // 6. Check if Forwarding Failed
+    // 10. Check if Forwarding Failed
     if (fSave.error_code) {
         return Bot.sendMessage(message.chat.id, message.message_id, "❌ Error forwarding to channel:\n" + fSave.description);
     }
 
-    // 7. Generate Links
+    // 11. Generate Links and Save to Database
     try {
         if (!fSave.message_id) {
             return Bot.sendMessage(message.chat.id, message.message_id, "❌ Error: Channel did not return a message ID.");
         }
 
         const final_hash = await Cryptic.Hash(fSave.message_id);
-        const final_link = `${url.origin}/?file=${final_hash}`
-        const final_stre = `${url.origin}/?file=${final_hash}&mode=inline`
-        const final_page = `${url.origin}/stream?file=${final_hash}`
-        const final_tele = `https://t.me/${bot.username}/?start=${final_hash}`
-        const vlc_link = `vlc://${url.origin.replace('https://', '').replace('http://', '')}/?file=${final_hash}&mode=inline`
-        const mx_link = `intent:${final_stre}#Intent;package=com.mxtech.videoplayer.ad;end`
+        const revokeToken = generateRevokeToken();
+        
+        // Save file to database
+        const userName = `${message.from.first_name}${message.from.username ? ' @' + message.from.username : ''}`;
+        await DB.saveFile(final_hash, fSave.message_id, message.from.id, userName, fName, fSize, fType, revokeToken);
+        
+        // Send enhanced channel message
+        const channelText = `ʀᴇǫᴜᴇsᴛᴇᴅ ʙʏ : 🍃⏤͟͟͞͞ ${message.from.first_name}${message.from.username ? ' @' + message.from.username : ''}\n` +
+                           `ᴜsᴇʀ ɪᴅ : ${message.from.id}\n` +
+                           `ғɪʟᴇ ɪᴅ : ${fSave.message_id}`;
+        await Bot.sendMessage(BOT_CHANNEL, fSave.message_id, channelText, []);
+        
+        const streamPage = `${url.origin}/stream?file=${final_hash}`;
+        const streamUrl = `${url.origin}/stream/${final_hash}`;
+        const downloadUrl = `${url.origin}/dl/${final_hash}`;
+        const final_tele = `https://t.me/${bot.username}/?start=${final_hash}`;
+        const vlc_link = `vlc://${url.origin.replace('https://', '').replace('http://', '')}/stream/${final_hash}`;
+        const mx_link = `intent:${streamUrl}#Intent;package=com.mxtech.videoplayer.ad;end`;
         const formattedSize = formatSize(fSize);
 
         const buttons = [
-            [{ text: "🌐 sᴛʀᴇᴀᴍ ᴘᴀɢᴇ", url: final_page }],
-            [{ text: "📥 ᴅᴏᴡɴʟᴏᴀᴅ", url: final_link }, { text: "🔗 ᴄᴏᴘʏ ʟɪɴᴋ", url: final_stre }],
+            [{ text: "🌐 sᴛʀᴇᴀᴍ ᴘᴀɢᴇ", url: streamPage }],
+            [{ text: "📥 ᴅᴏᴡɴʟᴏᴀᴅ", url: downloadUrl }, { text: "🔗 ᴄᴏᴘʏ ʟɪɴᴋ", url: streamUrl }],
             [{ text: "▶️ ᴠʟᴄ ᴘʟᴀʏᴇʀ", url: vlc_link }, { text: "📱 ᴍx ᴘʟᴀʏᴇʀ", url: mx_link }],
             [{ text: "💬 ᴛᴇʟᴇɢʀᴀᴍ", url: final_tele }, { text: "🔁 sʜᴀʀᴇ", switch_inline_query: final_hash }],
+            [{ text: "🗑️ ʀᴇᴠᴏᴋᴇ", callback_data: `revoke:${final_hash}` }],
             [{ text: "👑 ᴏᴡɴᴇʀ", url: `https://t.me/${OWNER_USERNAME}` }]
         ];
 
         let final_text = `*✨ ɴᴇᴡ ғɪʟᴇ ɢᴇɴᴇʀᴀᴛᴇᴅ*\n\n` +
                          `📂 *ғɪʟᴇ ɴᴀᴍᴇ:* \`${fName}\`\n` +
                          `💾 *ғɪʟᴇ sɪᴢᴇ:* \`${formattedSize}\`\n` +
-                         `📊 *ғɪʟᴇ ᴛʏᴘᴇ:* \`${fType}\`\n\n` +
-                         `*🔐 sᴇᴄᴜʀᴇ ʟɪɴᴋ:* \`${final_page}\``;
+                         `📊 *ғɪʟᴇ ᴛʏᴘᴇ:* \`${fType}\`\n` +
+                         `🔐 *ʀᴇᴠᴏᴋᴇ ᴛᴏᴋᴇɴ:* \`${revokeToken}\`\n\n` +
+                         `*🔗 sᴛʀᴇᴀᴍ ʟɪɴᴋ:* \`${streamUrl}\`\n\n` +
+                         `⚠️ *Save your revoke token to delete this file later!*`;
 
         return Bot.sendMessage(message.chat.id, message.message_id, final_text, buttons)
 
     } catch (error) {
         return Bot.sendMessage(message.chat.id, message.message_id, "❌ **Critical Error:**\n" + error.message);
     }
-}}}
+}
