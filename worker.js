@@ -14,6 +14,7 @@ const MAX_FILE_SIZE = 4294967296; // 4GB in bytes.
 const MONGODB_URI = "MONGODB_URI"; // Insert your MongoDB connection string (e.g., mongodb+srv://username:password@cluster.mongodb.net/filestream)
 const MONGODB_DATABASE = "filestream"; // MongoDB database name.
 const MONGODB_COLLECTION = "files"; // MongoDB collection name for storing file metadata.
+const MONGODB_USERS_COLLECTION = "users"; // MongoDB collection name for storing user data.
 
 
 // ---------- Do Not Modify ---------- // 
@@ -59,6 +60,39 @@ async function handleRequest(event) {
     if (url.pathname === '/unregisterWebhook') {return Bot.unregisterWebhook(event)}
     if (url.pathname === '/getMe') {return new Response(JSON.stringify(await Bot.getMe()), {headers: HEADERS_ERRR, status: 202})}
     if (url.pathname === '/') {return new Response(await getHomePage(), {headers: {'Content-Type': 'text/html'}})}
+    
+    // New URL format: /stream/FileID or /dl/FileID
+    if (url.pathname.startsWith('/stream/')) {
+        const fileId = url.pathname.substring(8);
+        if (!fileId) {return Raise(ERROR_404, 404);}
+        const streamCheck = await checkIfStreamable(fileId);
+        if (!streamCheck.isStreamable) {
+            return Raise({ok: false, error_code: 406, description: "This file type is not streamable. Only video and audio files can be streamed."}, 406);
+        }
+        return new Response(await getStreamPage(url, fileId), {headers: {'Content-Type': 'text/html'}});
+    }
+    
+    if (url.pathname.startsWith('/dl/')) {
+        const fileId = url.pathname.substring(4);
+        if (!fileId) {return Raise(ERROR_404, 404);}
+        const file_id = await Cryptic.deHash(fileId);
+        const retrieve = await RetrieveFile(BOT_CHANNEL, file_id);
+        if (retrieve.error_code) {return await Raise(retrieve, retrieve.error_code);}
+        const rdata = retrieve[0];
+        const rname = retrieve[1];
+        const rsize = retrieve[2];
+        const rtype = retrieve[3];
+        return new Response(rdata, {
+            status: 200, headers: {
+                "Content-Disposition": `attachment; filename=${rname}`,
+                "Content-Length": rsize,
+                "Content-Type": rtype,
+                "Accept-Ranges": "bytes",
+                ...HEADERS_FILE
+            }
+        });
+    }
+    
     if (url.pathname === '/stream' && file) {
         // Check if file is streamable before showing stream page
         const streamCheck = await checkIfStreamable(file);
@@ -343,6 +377,136 @@ class MongoDB {
             return { success: result.deletedCount > 0, result };
         } catch (error) {
             console.error('MongoDB delete error:', error);
+            return { success: false, error: error.message };
+        }
+    }
+
+    static async deleteAllFiles(userId = null) {
+        try {
+            const endpoint = `https://data.mongodb-api.com/app/data-nwmxs/endpoint/data/v1/action/deleteMany`;
+            
+            const filter = userId ? { user_id: userId } : {};
+            
+            const response = await fetch(endpoint, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'api-key': MONGODB_URI.split('api-key=')[1] || MONGODB_URI
+                },
+                body: JSON.stringify({
+                    dataSource: 'Cluster0',
+                    database: MONGODB_DATABASE,
+                    collection: MONGODB_COLLECTION,
+                    filter: filter
+                })
+            });
+
+            const result = await response.json();
+            return { success: true, deletedCount: result.deletedCount || 0 };
+        } catch (error) {
+            console.error('MongoDB delete all error:', error);
+            return { success: false, error: error.message };
+        }
+    }
+
+    static async getUserFiles(userId, limit = 10) {
+        try {
+            const endpoint = `https://data.mongodb-api.com/app/data-nwmxs/endpoint/data/v1/action/find`;
+            
+            const response = await fetch(endpoint, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'api-key': MONGODB_URI.split('api-key=')[1] || MONGODB_URI
+                },
+                body: JSON.stringify({
+                    dataSource: 'Cluster0',
+                    database: MONGODB_DATABASE,
+                    collection: MONGODB_COLLECTION,
+                    filter: { user_id: userId },
+                    sort: { created_at: -1 },
+                    limit: limit
+                })
+            });
+
+            const result = await response.json();
+            
+            if (result.documents) {
+                return { success: true, files: result.documents };
+            } else {
+                return { success: false, error: 'No files found' };
+            }
+        } catch (error) {
+            console.error('MongoDB get user files error:', error);
+            return { success: false, error: error.message };
+        }
+    }
+
+    // User management functions
+    static async registerUser(userId, userData) {
+        try {
+            const endpoint = `https://data.mongodb-api.com/app/data-nwmxs/endpoint/data/v1/action/updateOne`;
+            
+            const document = {
+                user_id: userId,
+                first_name: userData.first_name || '',
+                last_name: userData.last_name || '',
+                username: userData.username || '',
+                first_seen: new Date().toISOString(),
+                last_active: new Date().toISOString(),
+                file_count: 0
+            };
+
+            const response = await fetch(endpoint, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'api-key': MONGODB_URI.split('api-key=')[1] || MONGODB_URI
+                },
+                body: JSON.stringify({
+                    dataSource: 'Cluster0',
+                    database: MONGODB_DATABASE,
+                    collection: MONGODB_USERS_COLLECTION,
+                    filter: { user_id: userId },
+                    update: { $setOnInsert: document, $set: { last_active: new Date().toISOString() } },
+                    upsert: true
+                })
+            });
+
+            const result = await response.json();
+            return { success: true, result };
+        } catch (error) {
+            console.error('MongoDB register user error:', error);
+            return { success: false, error: error.message };
+        }
+    }
+
+    static async updateUserStats(userId) {
+        try {
+            const endpoint = `https://data.mongodb-api.com/app/data-nwmxs/endpoint/data/v1/action/updateOne`;
+            
+            const response = await fetch(endpoint, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'api-key': MONGODB_URI.split('api-key=')[1] || MONGODB_URI
+                },
+                body: JSON.stringify({
+                    dataSource: 'Cluster0',
+                    database: MONGODB_DATABASE,
+                    collection: MONGODB_USERS_COLLECTION,
+                    filter: { user_id: userId },
+                    update: { 
+                        $inc: { file_count: 1 },
+                        $set: { last_active: new Date().toISOString() }
+                    }
+                })
+            });
+
+            const result = await response.json();
+            return { success: true, result };
+        } catch (error) {
+            console.error('MongoDB update user stats error:', error);
             return { success: false, error: error.message };
         }
     }
@@ -754,7 +918,37 @@ class Bot {
   }
 
   static async sendMessage(chat_id, reply_id, text, reply_markup=[]) {
-    const response = await fetch(await this.apiUrl('sendMessage', {chat_id: chat_id, reply_to_message_id: reply_id, parse_mode: 'markdown', text, reply_markup: JSON.stringify({inline_keyboard: reply_markup})}))
+    const response = await fetch(await this.apiUrl('sendMessage', {chat_id: chat_id, reply_to_message_id: reply_id, parse_mode: 'markdown', text, reply_markup: JSON.stringify({inline_keyboard: reply_markup})}));
+    if (response.status == 200) {return (await response.json()).result;
+    } else {return await response.json()}
+  }
+
+  static async sendMessageSimple(chat_id, text, reply_markup=[]) {
+    const response = await fetch(await this.apiUrl('sendMessage', {chat_id: chat_id, parse_mode: 'markdown', text, reply_markup: JSON.stringify({inline_keyboard: reply_markup})}));
+    if (response.status == 200) {return (await response.json()).result;
+    } else {return await response.json()}
+  }
+
+  static async replyToMessage(chat_id, message_id, text) {
+    const response = await fetch(await this.apiUrl('sendMessage', {chat_id: chat_id, reply_to_message_id: message_id, text: text}));
+    if (response.status == 200) {return (await response.json()).result;
+    } else {return await response.json()}
+  }
+
+  static async deleteMessage(chat_id, message_id) {
+    const response = await fetch(await this.apiUrl('deleteMessage', {chat_id: chat_id, message_id: message_id}));
+    if (response.status == 200) {return (await response.json()).result;
+    } else {return await response.json()}
+  }
+
+  static async editMessageText(chat_id, message_id, text, reply_markup=[]) {
+    const response = await fetch(await this.apiUrl('editMessageText', {chat_id: chat_id, message_id: message_id, text: text, parse_mode: 'markdown', reply_markup: JSON.stringify({inline_keyboard: reply_markup})}));
+    if (response.status == 200) {return (await response.json()).result;
+    } else {return await response.json()}
+  }
+
+  static async answerCallbackQuery(callback_query_id, text, show_alert = false) {
+    const response = await fetch(await this.apiUrl('answerCallbackQuery', {callback_query_id: callback_query_id, text: text, show_alert: show_alert}));
     if (response.status == 200) {return (await response.json()).result;
     } else {return await response.json()}
   }
@@ -818,6 +1012,7 @@ class Bot {
   static async Update(event, update) {
     if (update.inline_query) {await onInline(event, update.inline_query)}
     if ('message' in update) {await onMessage(event, update.message)}
+    if ('callback_query' in update) {await onCallbackQuery(event, update.callback_query)}
   }
 }
 
@@ -903,10 +1098,17 @@ async function onMessage(event, message) {
 
     // 3. Handle Start Command
     if (message.text && (message.text === "/start" || message.text.startsWith("/start "))) {
+        // Register user in MongoDB
+        await MongoDB.registerUser(message.from.id, {
+            first_name: message.from.first_name,
+            last_name: message.from.last_name,
+            username: message.from.username
+        });
+        
         // Plain start
         if (message.text === "/start") {
              const buttons = [[{ text: "👨‍💻 Source Code", url: "https://github.com/vauth/filestream-cf" }]];
-             const startText = `👋 *ʜᴇʟʟᴏ ${message.from.first_name}*,\n\nI am a *ᴘʀᴇᴍɪᴜᴍ ғɪʟᴇ sᴛʀᴇᴀᴍ ʙᴏᴛ*.\n\n📂 *Send me any file* (Video, Audio, Document) and I will generate a direct download and streaming link for you.`;
+             const startText = `👋 *ʜᴇʟʟᴏ ${message.from.first_name}*,\n\nI am a *ᴘʀᴇᴍɪᴜᴍ ғɪʟᴇ sᴛʀᴇᴀᴍ ʙᴏᴛ*.\n\n📂 *Send me any file* (Video, Audio, Document) and I will generate a direct download and streaming link for you.\n\n📋 *Available Commands:*\n/files - View your uploaded files\n/revoke <token> - Delete a specific file\n/revokeall - Delete all your files`;
              return Bot.sendMessage(message.chat.id, message.message_id, startText, buttons);
         }
 
@@ -935,6 +1137,76 @@ async function onMessage(event, message) {
         } else {
             return Bot.sendMessage(message.chat.id, message.message_id, "Bad Request: File not found")
         }
+    }
+
+    // Handle /files command
+    if (message.text && message.text === "/files") {
+        const userFiles = await MongoDB.getUserFiles(message.chat.id, 20);
+        
+        if (!userFiles.success || userFiles.files.length === 0) {
+            return Bot.sendMessage(message.chat.id, message.message_id, "📭 *No files found*\n\nYou haven't uploaded any files yet.", []);
+        }
+        
+        let buttons = [];
+        for (let file of userFiles.files) {
+            buttons.push([{ text: `📄 ${file.file_name}`, callback_data: `file_${file.hash}` }]);
+        }
+        
+        const filesText = `📂 *Your Files* (${userFiles.files.length})\n\nClick on any file to view details:`;
+        return Bot.sendMessage(message.chat.id, message.message_id, filesText, buttons);
+    }
+
+    // Handle /revoke command
+    if (message.text && message.text.startsWith("/revoke")) {
+        const parts = message.text.split(" ");
+        
+        if (parts.length < 2) {
+            return Bot.sendMessage(message.chat.id, message.message_id, "⚠️ *Usage:* `/revoke <file_hash>`\n\nExample: `/revoke ABCD1234EFGH5678`", []);
+        }
+        
+        const fileHash = parts[1];
+        
+        try {
+            const file_id = await Cryptic.deHash(fileHash);
+            const fileData = await MongoDB.getFileMetadata(file_id);
+            
+            if (!fileData.success) {
+                return Bot.sendMessage(message.chat.id, message.message_id, "❌ *File not found*\n\nThe file hash is invalid or the file has already been deleted.", []);
+            }
+            
+            // Check if user owns the file or is owner
+            if (fileData.data.user_id !== message.chat.id && message.chat.id !== BOT_OWNER) {
+                return Bot.sendMessage(message.chat.id, message.message_id, "🚫 *Access Denied*\n\nYou can only delete your own files.", []);
+            }
+            
+            // Delete from MongoDB
+            await MongoDB.deleteFileMetadata(file_id);
+            
+            // Delete from channel
+            await Bot.deleteMessage(BOT_CHANNEL, file_id);
+            
+            return Bot.sendMessage(message.chat.id, message.message_id, `✅ *File deleted successfully*\n\n📂 File: \`${fileData.data.file_name}\`\n🗑️ The file has been permanently removed.`, []);
+            
+        } catch (error) {
+            console.error('Revoke error:', error);
+            return Bot.sendMessage(message.chat.id, message.message_id, `❌ *Error:* ${error.message}`, []);
+        }
+    }
+
+    // Handle /revokeall command
+    if (message.text && message.text === "/revokeall") {
+        const isOwner = message.chat.id === BOT_OWNER;
+        
+        const confirmText = isOwner 
+            ? "⚠️ *WARNING: Owner Delete All*\n\nThis will delete ALL files from ALL users!\n\nAre you sure?"
+            : "⚠️ *Delete All Your Files*\n\nThis will permanently delete all your uploaded files.\n\nAre you sure?";
+        
+        const buttons = [
+            [{ text: "✅ Yes, Delete All", callback_data: `revokeall_confirm` }],
+            [{ text: "❌ Cancel", callback_data: `revokeall_cancel` }]
+        ];
+        
+        return Bot.sendMessage(message.chat.id, message.message_id, confirmText, buttons);
     }
 
     // 4. Access Control
@@ -1004,7 +1276,9 @@ async function onMessage(event, message) {
             file_size: fSize,
             channel_id: BOT_CHANNEL,
             user_id: message.chat.id,
-            hash: final_hash
+            user_name: message.from.first_name + (message.from.last_name ? ' ' + message.from.last_name : ''),
+            hash: final_hash,
+            secret_token: await generateSecretToken()
         };
         
         const dbStore = await MongoDB.storeFileMetadata(fSave.message_id, fileData);
@@ -1015,10 +1289,17 @@ async function onMessage(event, message) {
             console.log('File metadata stored successfully in MongoDB:', dbStore.id);
         }
         
-        const final_link = `${url.origin}/?file=${final_hash}`;
-        const final_stre = `${url.origin}/?file=${final_hash}&mode=inline`;
+        // Update user stats
+        await MongoDB.updateUserStats(message.chat.id);
+        
+        // Send info message to bot channel as reply
+        const channelInfoText = `ʀᴇQᴜᴇsᴛᴇᴅ ʙʏ : 🍃⏤͟͟͞͞ ${message.from.first_name}${message.from.last_name ? ' ' + message.from.last_name : ''} 𝐓♩𝐓\nᴜsᴇʀ ɪᴅ : ${message.chat.id}\nғɪʟᴇ ɪᴅ : ${fSave.message_id}`;
+        await Bot.replyToMessage(BOT_CHANNEL, fSave.message_id, channelInfoText);
+        
+        const final_link = `${url.origin}/dl/${final_hash}`;
+        const final_stre = `${url.origin}/stream/${final_hash}`;
         const final_tele = `https://t.me/${bot.username}/?start=${final_hash}`;
-        const vlc_link = `vlc://${url.origin.replace('https://', '').replace('http://', '')}/?file=${final_hash}&mode=inline`;
+        const vlc_link = `vlc://${url.origin.replace('https://', '').replace('http://', '')}/stream/${final_hash}`;
         const formattedSize = formatSize(fSize);
 
         // Check if file is streamable (video/audio only)
@@ -1028,43 +1309,37 @@ async function onMessage(event, message) {
         let buttons = [];
         
         if (isStreamable) {
-            // For video/audio: Stream, Download, VLC, Copy Link
+            // For video/audio: Stream, Download, VLC, Revoke
             buttons = [
-                [{ text: "▶️ Stream", url: `${url.origin}/stream?file=${final_hash}` }],
+                [{ text: "▶️ Stream", url: final_stre }],
                 [{ text: "📥 Download", url: final_link }],
                 [{ text: "🎬 VLC Player", url: vlc_link }],
-                [{ text: "📋 Copy Download Link", url: final_link }]
+                [{ text: "🔴 Revoke File", callback_data: `revoke_${final_hash}` }]
             ];
         } else {
-            // For other files: Download and Copy Link only
+            // For other files: Download, Telegram, Revoke
             buttons = [
                 [{ text: "📥 Download", url: final_link }],
-                [{ text: "📋 Copy Download Link", url: final_link }],
-                [{ text: "💬 Telegram", url: final_tele }]
+                [{ text: "💬 Telegram", url: final_tele }],
+                [{ text: "🔴 Revoke File", callback_data: `revoke_${final_hash}` }]
             ];
         }
 
         let final_text = `✅ *File successfully processed!*\n\n` +
                          `📂 *File Name:* \`${fName}\`\n` +
                          `💾 *File Size:* \`${formattedSize}\`\n` +
-                         `📊 *File Type:* \`${fType}\`\n`;
+                         `📊 *File Type:* \`${fType}\`\n` +
+                         `🔐 *Secret Token:* \`${fileData.secret_token}\`\n`;
         
         if (isStreamable) {
             final_text += `🎬 *Streaming:* \`Available\`\n\n`;
-            final_text += `🔗 *Stream Link:*\n\`${url.origin}/stream?file=${final_hash}\``;
+            final_text += `🔗 *Stream Link:*\n\`${final_stre}\`\n\n`;
+            final_text += `🔗 *Download Link:*\n\`${final_link}\``;
         } else {
             final_text += `\n🔗 *Download Link:*\n\`${final_link}\``;
         }
-
-        // Track stats
-        if (ENABLE_STATS) {
-            await trackStats('file_generated', {
-                userId: message.chat.id,
-                fileType: fType,
-                fileSize: fSize,
-                timestamp: Date.now()
-            });
-        }
+        
+        final_text += `\n\n💡 *Tip:* Use \`/revoke ${final_hash}\` to delete this file.`;
 
         return Bot.sendMessage(message.chat.id, message.message_id, final_text, buttons);
 
@@ -1157,6 +1432,182 @@ async function checkIfStreamable(fileHash) {
     } catch (error) {
         return { isStreamable: false, error: error.message };
     }
+}
+
+// ---------- Callback Query Handler ---------- //
+
+async function onCallbackQuery(event, callback) {
+    const data = callback.data;
+    const chatId = callback.message.chat.id;
+    const messageId = callback.message.message_id;
+    let url = new URL(event.request.url);
+    let bot = await Bot.getMe();
+    
+    // Handle file info display
+    if (data.startsWith('file_')) {
+        const fileHash = data.substring(5);
+        
+        try {
+            const file_id = await Cryptic.deHash(fileHash);
+            const fileData = await MongoDB.getFileMetadata(file_id);
+            
+            if (!fileData.success) {
+                await Bot.answerCallbackQuery(callback.id, "❌ File not found", true);
+                return;
+            }
+            
+            const file = fileData.data;
+            const final_link = `${url.origin}/dl/${fileHash}`;
+            const final_stre = `${url.origin}/stream/${fileHash}`;
+            const final_tele = `https://t.me/${bot.username}/?start=${fileHash}`;
+            const vlc_link = `vlc://${url.origin.replace('https://', '').replace('http://', '')}/stream/${fileHash}`;
+            const formattedSize = formatSize(file.file_size);
+            const isStreamable = STREAMABLE_TYPES.includes(file.mime_type);
+            
+            let buttons = [];
+            
+            if (isStreamable) {
+                buttons = [
+                    [{ text: "▶️ Stream", url: final_stre }],
+                    [{ text: "📥 Download", url: final_link }],
+                    [{ text: "🎬 VLC Player", url: vlc_link }],
+                    [{ text: "🔴 Revoke File", callback_data: `revoke_${fileHash}` }],
+                    [{ text: "« Back to Files", callback_data: "back_to_files" }]
+                ];
+            } else {
+                buttons = [
+                    [{ text: "📥 Download", url: final_link }],
+                    [{ text: "💬 Telegram", url: final_tele }],
+                    [{ text: "🔴 Revoke File", callback_data: `revoke_${fileHash}` }],
+                    [{ text: "« Back to Files", callback_data: "back_to_files" }]
+                ];
+            }
+            
+            let fileText = `📂 *File Details*\n\n` +
+                          `📄 *Name:* \`${file.file_name}\`\n` +
+                          `💾 *Size:* \`${formattedSize}\`\n` +
+                          `📊 *Type:* \`${file.file_type}\`\n` +
+                          `🔐 *Secret:* \`${file.secret_token}\`\n`;
+            
+            if (isStreamable) {
+                fileText += `🎬 *Streaming:* \`Available\`\n\n`;
+                fileText += `🔗 *Stream:* \`${final_stre}\`\n`;
+                fileText += `🔗 *Download:* \`${final_link}\``;
+            } else {
+                fileText += `\n🔗 *Download:* \`${final_link}\``;
+            }
+            
+            await Bot.editMessageText(chatId, messageId, fileText, buttons);
+            await Bot.answerCallbackQuery(callback.id, "✅ File info loaded");
+            
+        } catch (error) {
+            console.error('Callback file error:', error);
+            await Bot.answerCallbackQuery(callback.id, "❌ Error loading file", true);
+        }
+    }
+    
+    // Handle back to files list
+    if (data === 'back_to_files') {
+        const userFiles = await MongoDB.getUserFiles(chatId, 20);
+        
+        if (!userFiles.success || userFiles.files.length === 0) {
+            await Bot.answerCallbackQuery(callback.id, "No files found", true);
+            return;
+        }
+        
+        let buttons = [];
+        for (let file of userFiles.files) {
+            buttons.push([{ text: `📄 ${file.file_name}`, callback_data: `file_${file.hash}` }]);
+        }
+        
+        const filesText = `📂 *Your Files* (${userFiles.files.length})\n\nClick on any file to view details:`;
+        await Bot.editMessageText(chatId, messageId, filesText, buttons);
+        await Bot.answerCallbackQuery(callback.id, "Files list refreshed");
+    }
+    
+    // Handle file revoke
+    if (data.startsWith('revoke_')) {
+        const fileHash = data.substring(7);
+        
+        try {
+            const file_id = await Cryptic.deHash(fileHash);
+            const fileData = await MongoDB.getFileMetadata(file_id);
+            
+            if (!fileData.success) {
+                await Bot.answerCallbackQuery(callback.id, "❌ File not found", true);
+                return;
+            }
+            
+            // Check if user owns the file or is owner
+            if (fileData.data.user_id !== chatId && chatId !== BOT_OWNER) {
+                await Bot.answerCallbackQuery(callback.id, "🚫 You can only delete your own files", true);
+                return;
+            }
+            
+            // Delete from MongoDB
+            await MongoDB.deleteFileMetadata(file_id);
+            
+            // Delete from channel
+            await Bot.deleteMessage(BOT_CHANNEL, file_id);
+            
+            await Bot.editMessageText(chatId, messageId, `✅ *File deleted successfully*\n\n📂 File: \`${fileData.data.file_name}\`\n🗑️ The file has been permanently removed.`, []);
+            await Bot.answerCallbackQuery(callback.id, "✅ File deleted");
+            
+        } catch (error) {
+            console.error('Revoke callback error:', error);
+            await Bot.answerCallbackQuery(callback.id, "❌ Error deleting file", true);
+        }
+    }
+    
+    // Handle revokeall confirm
+    if (data === 'revokeall_confirm') {
+        const isOwner = chatId === BOT_OWNER;
+        
+        try {
+            let deleteResult;
+            
+            if (isOwner) {
+                // Owner deletes all files from all users
+                deleteResult = await MongoDB.deleteAllFiles();
+            } else {
+                // User deletes only their files
+                deleteResult = await MongoDB.deleteAllFiles(chatId);
+            }
+            
+            if (deleteResult.success) {
+                const deletedText = isOwner 
+                    ? `✅ *All files deleted*\n\n🗑️ Deleted ${deleteResult.deletedCount} files from all users.`
+                    : `✅ *All your files deleted*\n\n🗑️ Deleted ${deleteResult.deletedCount} files.`;
+                
+                await Bot.editMessageText(chatId, messageId, deletedText, []);
+                await Bot.answerCallbackQuery(callback.id, `✅ Deleted ${deleteResult.deletedCount} files`);
+            } else {
+                await Bot.editMessageText(chatId, messageId, `❌ *Error deleting files*\n\n${deleteResult.error}`, []);
+                await Bot.answerCallbackQuery(callback.id, "❌ Error occurred", true);
+            }
+            
+        } catch (error) {
+            console.error('Revokeall error:', error);
+            await Bot.answerCallbackQuery(callback.id, "❌ Error deleting files", true);
+        }
+    }
+    
+    // Handle revokeall cancel
+    if (data === 'revokeall_cancel') {
+        await Bot.editMessageText(chatId, messageId, "❌ *Operation cancelled*\n\nNo files were deleted.", []);
+        await Bot.answerCallbackQuery(callback.id, "Cancelled");
+    }
+}
+
+// ---------- Secret Token Generator ---------- //
+
+async function generateSecretToken() {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    let token = '';
+    for (let i = 0; i < 16; i++) {
+        token += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return token;
 }
 
 // ---------- Stats Page Generator ---------- //
