@@ -2,3 +2,18 @@ name = "streamfile-cf"
 main = "worker.js"
 compatibility_date = "2024-05-29"
 compatibility_flags = ["nodejs_compat"]
+
+# Optional: KV Namespaces for database functionality
+# Uncomment and set your KV namespace IDs if you want to use KV storage
+# [[kv_namespaces]]
+# binding = "FILES"
+# id = "your-files-kv-namespace-id"
+
+# [[kv_namespaces]]
+# binding = "USERS"
+# id = "your-users-kv-namespace-id"
+
+# Optional: Environment variables
+# [vars]
+# MONGODB_URI = "your-mongodb-connection-string"
+# DB_NAME = "filestream_bot"
