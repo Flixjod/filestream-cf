@@ -9,11 +9,6 @@ const SIA_SECRET = "SIA_SECRET"; // Insert a powerful secret text and keep it sa
 const PUBLIC_BOT = false; // Make your bot public (only [true, false] are allowed).
 const OWNER_USERNAME = "FLiX_LY"; // Insert your telegram username for credits.
 const BOT_NAME = "FileStream Bot"; // Insert your bot display name.
-const RATE_LIMIT_REQUESTS = 30; // Max requests per minute per user.
-const MAX_FILE_SIZE = 4294967296; // 4GB in bytes.
-const MONGODB_URI = "MONGODB_URI"; // Insert your MongoDB connection string (e.g., mongodb+srv://username:password@cluster.mongodb.net/filestream)
-const MONGODB_DATABASE = "filestream"; // MongoDB database name.
-const MONGODB_COLLECTION = "files"; // MongoDB collection name for storing file metadata.
 
 
 // ---------- Do Not Modify ---------- // 
@@ -26,21 +21,6 @@ const ERROR_405 = {"ok":false,"error_code":405,"description":"Bad Request: metho
 const ERROR_406 = {"ok":false,"error_code":406,"description":"Bad Request: file type invalid"};
 const ERROR_407 = {"ok":false,"error_code":407,"description":"Bad Request: file hash invalid by atob"};
 const ERROR_408 = {"ok":false,"error_code":408,"description":"Bad Request: mode not in [attachment, inline]"};
-const ERROR_429 = {"ok":false,"error_code":429,"description":"Too Many Requests: rate limit exceeded"};
-const ERROR_413 = {"ok":false,"error_code":413,"description":"File Too Large: maximum size exceeded"};
-const ERROR_500 = {"ok":false,"error_code":500,"description":"Internal Server Error: database operation failed"};
-const ERROR_404_DB = {"ok":false,"error_code":404,"description":"File not found in database"};
-
-// Video/Audio MIME types for streaming
-const STREAMABLE_TYPES = [
-    'video/mp4', 'video/x-matroska', 'video/webm', 'video/quicktime', 'video/x-msvideo',
-    'video/mpeg', 'video/3gpp', 'video/x-flv', 'video/x-ms-wmv',
-    'audio/mpeg', 'audio/mp4', 'audio/wav', 'audio/ogg', 'audio/webm', 'audio/flac',
-    'audio/aac', 'audio/x-m4a', 'audio/opus'
-];
-
-// Rate limiting storage
-const rateLimitMap = new Map();
 
 // ---------- Event Listener ---------- // 
 
@@ -59,14 +39,7 @@ async function handleRequest(event) {
     if (url.pathname === '/unregisterWebhook') {return Bot.unregisterWebhook(event)}
     if (url.pathname === '/getMe') {return new Response(JSON.stringify(await Bot.getMe()), {headers: HEADERS_ERRR, status: 202})}
     if (url.pathname === '/') {return new Response(await getHomePage(), {headers: {'Content-Type': 'text/html'}})}
-    if (url.pathname === '/stream' && file) {
-        // Check if file is streamable before showing stream page
-        const streamCheck = await checkIfStreamable(file);
-        if (!streamCheck.isStreamable) {
-            return Raise({ok: false, error_code: 406, description: "This file type is not streamable. Only video and audio files can be streamed."}, 406);
-        }
-        return new Response(await getStreamPage(url, file), {headers: {'Content-Type': 'text/html'}});
-    }
+    if (url.pathname === '/stream' && file) {return new Response(await getStreamPage(url, file), {headers: {'Content-Type': 'text/html'}})}
 
     if (!file) {return Raise(ERROR_404, 404);}
     if (!["attachment", "inline", "stream"].includes(mode)) {return Raise(ERROR_408, 404)}
@@ -103,68 +76,40 @@ async function handleRequest(event) {
 // ---------- Retrieve File ---------- //
 
 async function RetrieveFile(channel_id, message_id) {
-    // Try to get file metadata from MongoDB first
-    const dbResult = await MongoDB.getFileMetadata(message_id);
-    
-    if (dbResult.success && dbResult.data) {
-        const metadata = dbResult.data;
-        
-        // Use stored file_id to get file from Telegram
-        const file = await Bot.getFile(metadata.file_id);
-        if (file.error_code) {
-            console.error('File retrieval error:', file);
-            return file;
-        }
-
-        return [
-            await Bot.fetchFile(file.file_path),
-            metadata.file_name,
-            metadata.file_size,
-            metadata.mime_type
-        ];
-    }
-    
-    // Fallback: If not in MongoDB, try the old editMessage method (for backward compatibility)
-    console.log('File not found in MongoDB, trying editMessage fallback...');
-    let fID; let fName; let fType; let fSize; let fLen;
+    let  fID; let fName; let fType; let fSize; let fLen;
     let data = await Bot.editMessage(channel_id, message_id, await UUID());
+    if (data.error_code){return data}
     
-    if (data.error_code) {
-        return data;
-    }
-    
-    if (data.document) {
-        fLen = data.document.length - 1;
+    if (data.document){
+        fLen = data.document.length - 1
         fID = data.document.file_id;
         fName = data.document.file_name;
         fType = data.document.mime_type;
         fSize = data.document.file_size;
     } else if (data.audio) {
-        fLen = data.audio.length - 1;
+        fLen = data.audio.length - 1
         fID = data.audio.file_id;
         fName = data.audio.file_name;
         fType = data.audio.mime_type;
         fSize = data.audio.file_size;
     } else if (data.video) {
-        fLen = data.video.length - 1;
+        fLen = data.video.length - 1
         fID = data.video.file_id;
         fName = data.video.file_name;
         fType = data.video.mime_type;
         fSize = data.video.file_size;
     } else if (data.photo) {
-        fLen = data.photo.length - 1;
+        fLen = data.photo.length - 1
         fID = data.photo[fLen].file_id;
         fName = data.photo[fLen].file_unique_id + '.jpg';
         fType = "image/jpg";
         fSize = data.photo[fLen].file_size;
     } else {
-        return ERROR_406;
+        return ERROR_406
     }
 
-    const file = await Bot.getFile(fID);
-    if (file.error_code) {
-        return file;
-    }
+    const file = await Bot.getFile(fID)
+    if (file.error_code){return file}
 
     return [await Bot.fetchFile(file.file_path), fName, fSize, fType];
 }
@@ -173,179 +118,6 @@ async function RetrieveFile(channel_id, message_id) {
 
 async function Raise(json_error, status_code) {
     return new Response(JSON.stringify(json_error), { headers: HEADERS_ERRR, status: status_code });
-}
-
-// ---------- MongoDB Integration ---------- //
-
-class MongoDB {
-    static async connect() {
-        // MongoDB Data API endpoint
-        const url = MONGODB_URI.includes('mongodb.net') 
-            ? `https://data.mongodb-api.com/app/data-${MONGODB_URI.split('@')[1].split('.')[0]}/endpoint/data/v1`
-            : MONGODB_URI;
-        
-        return url;
-    }
-
-    static async storeFileMetadata(messageId, fileData) {
-        try {
-            const endpoint = `https://data.mongodb-api.com/app/data-nwmxs/endpoint/data/v1/action/insertOne`;
-            
-            const document = {
-                message_id: messageId.toString(),
-                file_id: fileData.file_id,
-                file_name: fileData.file_name,
-                file_type: fileData.file_type,
-                mime_type: fileData.mime_type,
-                file_size: fileData.file_size,
-                channel_id: fileData.channel_id,
-                user_id: fileData.user_id,
-                created_at: new Date().toISOString(),
-                hash: fileData.hash
-            };
-
-            const response = await fetch(endpoint, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'api-key': MONGODB_URI.split('api-key=')[1] || MONGODB_URI
-                },
-                body: JSON.stringify({
-                    dataSource: 'Cluster0',
-                    database: MONGODB_DATABASE,
-                    collection: MONGODB_COLLECTION,
-                    document: document
-                })
-            });
-
-            const result = await response.json();
-            
-            if (result.insertedId) {
-                return { success: true, id: result.insertedId };
-            } else {
-                console.error('MongoDB insert failed:', result);
-                return { success: false, error: result };
-            }
-        } catch (error) {
-            console.error('MongoDB store error:', error);
-            return { success: false, error: error.message };
-        }
-    }
-
-    static async getFileMetadata(messageId) {
-        try {
-            const endpoint = `https://data.mongodb-api.com/app/data-nwmxs/endpoint/data/v1/action/findOne`;
-            
-            const response = await fetch(endpoint, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'api-key': MONGODB_URI.split('api-key=')[1] || MONGODB_URI
-                },
-                body: JSON.stringify({
-                    dataSource: 'Cluster0',
-                    database: MONGODB_DATABASE,
-                    collection: MONGODB_COLLECTION,
-                    filter: { message_id: messageId.toString() }
-                })
-            });
-
-            const result = await response.json();
-            
-            if (result.document) {
-                return { success: true, data: result.document };
-            } else {
-                return { success: false, error: 'File not found' };
-            }
-        } catch (error) {
-            console.error('MongoDB get error:', error);
-            return { success: false, error: error.message };
-        }
-    }
-
-    static async getFileByHash(hash) {
-        try {
-            const endpoint = `https://data.mongodb-api.com/app/data-nwmxs/endpoint/data/v1/action/findOne`;
-            
-            const response = await fetch(endpoint, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'api-key': MONGODB_URI.split('api-key=')[1] || MONGODB_URI
-                },
-                body: JSON.stringify({
-                    dataSource: 'Cluster0',
-                    database: MONGODB_DATABASE,
-                    collection: MONGODB_COLLECTION,
-                    filter: { hash: hash }
-                })
-            });
-
-            const result = await response.json();
-            
-            if (result.document) {
-                return { success: true, data: result.document };
-            } else {
-                return { success: false, error: 'File not found' };
-            }
-        } catch (error) {
-            console.error('MongoDB get by hash error:', error);
-            return { success: false, error: error.message };
-        }
-    }
-
-    static async updateFileMetadata(messageId, updates) {
-        try {
-            const endpoint = `https://data.mongodb-api.com/app/data-nwmxs/endpoint/data/v1/action/updateOne`;
-            
-            const response = await fetch(endpoint, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'api-key': MONGODB_URI.split('api-key=')[1] || MONGODB_URI
-                },
-                body: JSON.stringify({
-                    dataSource: 'Cluster0',
-                    database: MONGODB_DATABASE,
-                    collection: MONGODB_COLLECTION,
-                    filter: { message_id: messageId.toString() },
-                    update: { $set: { ...updates, updated_at: new Date().toISOString() } }
-                })
-            });
-
-            const result = await response.json();
-            return { success: result.matchedCount > 0, result };
-        } catch (error) {
-            console.error('MongoDB update error:', error);
-            return { success: false, error: error.message };
-        }
-    }
-
-    static async deleteFileMetadata(messageId) {
-        try {
-            const endpoint = `https://data.mongodb-api.com/app/data-nwmxs/endpoint/data/v1/action/deleteOne`;
-            
-            const response = await fetch(endpoint, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'api-key': MONGODB_URI.split('api-key=')[1] || MONGODB_URI
-                },
-                body: JSON.stringify({
-                    dataSource: 'Cluster0',
-                    database: MONGODB_DATABASE,
-                    collection: MONGODB_COLLECTION,
-                    filter: { message_id: messageId.toString() }
-                })
-            });
-
-            const result = await response.json();
-            return { success: result.deletedCount > 0, result };
-        } catch (error) {
-            console.error('MongoDB delete error:', error);
-            return { success: false, error: error.message };
-        }
-    }
 }
 
 // ---------- Range Request Handler ---------- //
@@ -388,38 +160,26 @@ async function getStreamPage(url, fileHash) {
     const downloadUrl = `${url.origin}/?file=${fileHash}`;
     const telegramUrl = `https://t.me/${bot.username}/?start=${fileHash}`;
      
-    // Get file info from MongoDB first
+    // Get file info
     let fileName = 'Media File';
     let fileType = 'video';
     try {
+        const channel_id = BOT_CHANNEL;
         const file_id = await Cryptic.deHash(fileHash);
-        const dbResult = await MongoDB.getFileMetadata(file_id);
-        
-        if (dbResult.success && dbResult.data) {
-            const metadata = dbResult.data;
-            fileName = metadata.file_name;
-            fileType = metadata.mime_type.startsWith('video') ? 'video' : 
-                      metadata.mime_type.startsWith('audio') ? 'audio' : 'document';
-        } else {
-            // Fallback to editMessage
-            const channel_id = BOT_CHANNEL;
-            const data = await Bot.editMessage(channel_id, file_id, await UUID());
-             
-            if (data.document) {
-                fileName = data.document.file_name;
-                fileType = data.document.mime_type.startsWith('video') ? 'video' : 
-                          data.document.mime_type.startsWith('audio') ? 'audio' : 'document';
-            } else if (data.video) {
-                fileName = data.video.file_name || 'Video File';
-                fileType = 'video';
-            } else if (data.audio) {
-                fileName = data.audio.file_name || 'Audio File';
-                fileType = 'audio';
-            }
+        const data = await Bot.editMessage(channel_id, file_id, await UUID());
+         
+        if (data.document) {
+            fileName = data.document.file_name;
+            fileType = data.document.mime_type.startsWith('video') ? 'video' : 
+                      data.document.mime_type.startsWith('audio') ? 'audio' : 'document';
+        } else if (data.video) {
+            fileName = data.video.file_name || 'Video File';
+            fileType = 'video';
+        } else if (data.audio) {
+            fileName = data.audio.file_name || 'Audio File';
+            fileType = 'audio';
         }
-    } catch (e) {
-        console.error('Error getting file info:', e);
-    }
+    } catch (e) {}
      
     const vlcUrl = `vlc://${streamUrl.replace('https://', '').replace('http://', '')}`;
     const mxUrl = `intent:${streamUrl}#Intent;package=com.mxtech.videoplayer.ad;end`;
@@ -886,7 +646,7 @@ async function onInline(event, inline) {
 // ---------- Message Listener ---------- // 
 
 async function onMessage(event, message) {
-    let fID; let fName; let fSave; let fType; let fFullType; let fSize = 0;
+    let fID; let fName; let fSave; let fType; let fSize = 0;
     let url = new URL(event.request.url);
     let bot = await Bot.getMe();
 
@@ -895,11 +655,6 @@ async function onMessage(event, message) {
 
     // 2. Ignore messages from channels
     if (message.chat.id.toString().includes("-100")) { return }
-
-    // Rate limiting check
-    if (!checkRateLimit(message.chat.id)) {
-        return Bot.sendMessage(message.chat.id, message.message_id, "⚠️ *Rate limit exceeded*\n\nPlease wait a moment before sending more files.", []);
-    }
 
     // 3. Handle Start Command
     if (message.text && (message.text === "/start" || message.text.startsWith("/start "))) {
@@ -947,39 +702,30 @@ async function onMessage(event, message) {
     if (message.document) {
         fID = message.document.file_id;
         fName = message.document.file_name;
-        fFullType = message.document.mime_type;
         fType = message.document.mime_type.split("/")[0];
         fSize = message.document.file_size;
         fSave = await Bot.sendDocument(BOT_CHANNEL, fID)
     } else if (message.audio) {
         fID = message.audio.file_id;
-        fName = message.audio.file_name || "Audio File.mp3";
-        fFullType = message.audio.mime_type;
-        fType = "audio";
+        fName = message.audio.file_name || "Audio File";
+        fType = message.audio.mime_type.split("/")[0];
         fSize = message.audio.file_size;
         fSave = await Bot.sendDocument(BOT_CHANNEL, fID)
     } else if (message.video) {
         fID = message.video.file_id;
-        fName = message.video.file_name || "Video File.mp4";
-        fFullType = message.video.mime_type;
-        fType = "video";
+        fName = message.video.file_name || "Video File";
+        fType = message.video.mime_type.split("/")[0];
         fSize = message.video.file_size;
         fSave = await Bot.sendDocument(BOT_CHANNEL, fID)
     } else if (message.photo) {
         fID = message.photo[message.photo.length - 1].file_id;
         fName = message.photo[message.photo.length - 1].file_unique_id + '.jpg';
-        fFullType = "image/jpeg";
         fType = "image";
         fSize = message.photo[message.photo.length - 1].file_size;
         fSave = await Bot.sendPhoto(BOT_CHANNEL, fID)
     } else {
-        const buttons = [[{ text: "📚 Source Code", url: "https://github.com/vauth/filestream-cf" }]];
-        return Bot.sendMessage(message.chat.id, message.message_id, "📤 *Send me any file!*\n\n✅ Supported: Video, Audio, Document, Image\n📊 Maximum size: 4GB (Telegram) / 20MB (Direct Download)", buttons)
-    }
-
-    // File size validation
-    if (fSize > MAX_FILE_SIZE) {
-        return Bot.sendMessage(message.chat.id, message.message_id, `❌ *File too large!*\n\n📊 File size: ${formatSize(fSize)}\n⚠️ Maximum: ${formatSize(MAX_FILE_SIZE)}`, []);
+        const buttons = [[{ text: "Source Code", url: "https://github.com/vauth/filestream-cf" }]];
+        return Bot.sendMessage(message.chat.id, message.message_id, "Send me any file/video/gif/audio *(t<=4GB, e<=20MB)*.", buttons)
     }
 
     // 6. Check if Forwarding Failed
@@ -987,176 +733,38 @@ async function onMessage(event, message) {
         return Bot.sendMessage(message.chat.id, message.message_id, "❌ Error forwarding to channel:\n" + fSave.description);
     }
 
-    // 7. Store File Metadata in MongoDB & Generate Links
+    // 7. Generate Links
     try {
         if (!fSave.message_id) {
-            return Bot.sendMessage(message.chat.id, message.message_id, "❌ *Error:* Channel did not return a message ID.\n\nPlease check if the bot is admin in the channel.");
+            return Bot.sendMessage(message.chat.id, message.message_id, "❌ Error: Channel did not return a message ID.");
         }
 
         const final_hash = await Cryptic.Hash(fSave.message_id);
-        
-        // Store file metadata in MongoDB
-        const fileData = {
-            file_id: fID,
-            file_name: fName,
-            file_type: fType,
-            mime_type: fFullType,
-            file_size: fSize,
-            channel_id: BOT_CHANNEL,
-            user_id: message.chat.id,
-            hash: final_hash
-        };
-        
-        const dbStore = await MongoDB.storeFileMetadata(fSave.message_id, fileData);
-        
-        if (!dbStore.success) {
-            console.warn('MongoDB storage failed, file will use fallback method:', dbStore.error);
-        } else {
-            console.log('File metadata stored successfully in MongoDB:', dbStore.id);
-        }
-        
-        const final_link = `${url.origin}/?file=${final_hash}`;
-        const final_stre = `${url.origin}/?file=${final_hash}&mode=inline`;
-        const final_tele = `https://t.me/${bot.username}/?start=${final_hash}`;
-        const vlc_link = `vlc://${url.origin.replace('https://', '').replace('http://', '')}/?file=${final_hash}&mode=inline`;
+        const final_link = `${url.origin}/?file=${final_hash}`
+        const final_stre = `${url.origin}/?file=${final_hash}&mode=inline`
+        const final_page = `${url.origin}/stream?file=${final_hash}`
+        const final_tele = `https://t.me/${bot.username}/?start=${final_hash}`
+        const vlc_link = `vlc://${url.origin.replace('https://', '').replace('http://', '')}/?file=${final_hash}&mode=inline`
+        const mx_link = `intent:${final_stre}#Intent;package=com.mxtech.videoplayer.ad;end`
         const formattedSize = formatSize(fSize);
 
-        // Check if file is streamable (video/audio only)
-        const isStreamable = STREAMABLE_TYPES.includes(fFullType);
+        const buttons = [
+            [{ text: "🌐 sᴛʀᴇᴀᴍ ᴘᴀɢᴇ", url: final_page }],
+            [{ text: "📥 ᴅᴏᴡɴʟᴏᴀᴅ", url: final_link }, { text: "🔗 ᴄᴏᴘʏ ʟɪɴᴋ", url: final_stre }],
+            [{ text: "▶️ ᴠʟᴄ ᴘʟᴀʏᴇʀ", url: vlc_link }, { text: "📱 ᴍx ᴘʟᴀʏᴇʀ", url: mx_link }],
+            [{ text: "💬 ᴛᴇʟᴇɢʀᴀᴍ", url: final_tele }, { text: "🔁 sʜᴀʀᴇ", switch_inline_query: final_hash }],
+            [{ text: "👑 ᴏᴡɴᴇʀ", url: `https://t.me/${OWNER_USERNAME}` }]
+        ];
 
-        // Build button layout based on file type
-        let buttons = [];
-        
-        if (isStreamable) {
-            // For video/audio: Stream, Download, VLC, Copy Link
-            buttons = [
-                [{ text: "▶️ Stream", url: `${url.origin}/stream?file=${final_hash}` }],
-                [{ text: "📥 Download", url: final_link }],
-                [{ text: "🎬 VLC Player", url: vlc_link }],
-                [{ text: "📋 Copy Download Link", url: final_link }]
-            ];
-        } else {
-            // For other files: Download and Copy Link only
-            buttons = [
-                [{ text: "📥 Download", url: final_link }],
-                [{ text: "📋 Copy Download Link", url: final_link }],
-                [{ text: "💬 Telegram", url: final_tele }]
-            ];
-        }
+        let final_text = `*✨ ɴᴇᴡ ғɪʟᴇ ɢᴇɴᴇʀᴀᴛᴇᴅ*\n\n` +
+                         `📂 *ғɪʟᴇ ɴᴀᴍᴇ:* \`${fName}\`\n` +
+                         `💾 *ғɪʟᴇ sɪᴢᴇ:* \`${formattedSize}\`\n` +
+                         `📊 *ғɪʟᴇ ᴛʏᴘᴇ:* \`${fType}\`\n\n` +
+                         `*🔐 sᴇᴄᴜʀᴇ ʟɪɴᴋ:* \`${final_page}\``;
 
-        let final_text = `✅ *File successfully processed!*\n\n` +
-                         `📂 *File Name:* \`${fName}\`\n` +
-                         `💾 *File Size:* \`${formattedSize}\`\n` +
-                         `📊 *File Type:* \`${fType}\`\n`;
-        
-        if (isStreamable) {
-            final_text += `🎬 *Streaming:* \`Available\`\n\n`;
-            final_text += `🔗 *Stream Link:*\n\`${url.origin}/stream?file=${final_hash}\``;
-        } else {
-            final_text += `\n🔗 *Download Link:*\n\`${final_link}\``;
-        }
-
-        // Track stats
-        if (ENABLE_STATS) {
-            await trackStats('file_generated', {
-                userId: message.chat.id,
-                fileType: fType,
-                fileSize: fSize,
-                timestamp: Date.now()
-            });
-        }
-
-        return Bot.sendMessage(message.chat.id, message.message_id, final_text, buttons);
+        return Bot.sendMessage(message.chat.id, message.message_id, final_text, buttons)
 
     } catch (error) {
-        console.error('Link generation error:', error);
-        return Bot.sendMessage(message.chat.id, message.message_id, `❌ *Critical Error:*\n\n${error.message || 'Unknown error occurred'}\n\nPlease try again or contact support.`);
+        return Bot.sendMessage(message.chat.id, message.message_id, "❌ **Critical Error:**\n" + error.message);
     }
-}
-
-// ---------- Rate Limiting ---------- //
-
-function checkRateLimit(userId) {
-    const now = Date.now();
-    const userKey = `user_${userId}`;
-    
-    if (!rateLimitMap.has(userKey)) {
-        rateLimitMap.set(userKey, { count: 1, resetTime: now + 60000 });
-        return true;
-    }
-    
-    const userData = rateLimitMap.get(userKey);
-    
-    if (now > userData.resetTime) {
-        rateLimitMap.set(userKey, { count: 1, resetTime: now + 60000 });
-        return true;
-    }
-    
-    if (userData.count >= RATE_LIMIT_REQUESTS) {
-        return false;
-    }
-    
-    userData.count++;
-    rateLimitMap.set(userKey, userData);
-    return true;
-}
-
-// ---------- Statistics Tracking ---------- //
-
-async function trackStats(eventType, data) {
-    try {
-        // This can be extended to use KV storage or external analytics
-        console.log(`[STATS] ${eventType}:`, JSON.stringify(data));
-    } catch (error) {
-        console.error('Stats tracking error:', error);
-    }
-}
-
-// ---------- Check If File Is Streamable ---------- //
-
-async function checkIfStreamable(fileHash) {
-    try {
-        const file_id = await Cryptic.deHash(fileHash);
-        
-        // Try MongoDB first
-        const dbResult = await MongoDB.getFileMetadata(file_id);
-        
-        if (dbResult.success && dbResult.data) {
-            const mimeType = dbResult.data.mime_type;
-            
-            if (mimeType && STREAMABLE_TYPES.includes(mimeType)) {
-                return { isStreamable: true, mimeType: mimeType };
-            }
-            
-            return { isStreamable: false, reason: 'File type not supported for streaming' };
-        }
-        
-        // Fallback: Try editMessage method
-        const channel_id = BOT_CHANNEL;
-        const data = await Bot.editMessage(channel_id, file_id, await UUID());
-        
-        if (data.error_code) {
-            return { isStreamable: false, error: data.description };
-        }
-        
-        let mimeType = null;
-        
-        if (data.document && data.document.mime_type) {
-            mimeType = data.document.mime_type;
-        } else if (data.video && data.video.mime_type) {
-            mimeType = data.video.mime_type;
-        } else if (data.audio && data.audio.mime_type) {
-            mimeType = data.audio.mime_type;
-        }
-        
-        if (mimeType && STREAMABLE_TYPES.includes(mimeType)) {
-            return { isStreamable: true, mimeType: mimeType };
-        }
-        
-        return { isStreamable: false, reason: 'File type not supported for streaming' };
-    } catch (error) {
-        return { isStreamable: false, error: error.message };
-    }
-}
-
-// ---------- Stats Page Generator ---------- //
+}}}
