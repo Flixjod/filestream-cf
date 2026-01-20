@@ -16,11 +16,19 @@ const BOT_NAME = "FileStream Bot"; // Insert your bot display name.
 const WHITE_METHODS = ["GET", "POST", "HEAD"];
 const HEADERS_FILE = {"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type"};
 const HEADERS_ERRR = {'Access-Control-Allow-Origin': '*', 'content-type': 'application/json'};
+
+// File size limits in bytes
+const MAX_TELEGRAM_SIZE = 4 * 1024 * 1024 * 1024; // 4GB for Telegram/Inline
+const MAX_STREAM_SIZE = 2 * 1024 * 1024 * 1024; // 2GB for direct stream/download
+const CHUNK_SIZE = 1024 * 1024; // 1MB chunks for streaming
+
 const ERROR_404 = {"ok":false,"error_code":404,"description":"Bad Request: missing /?file= parameter", "credit": "https://github.com/vauth/filestream-cf"};
 const ERROR_405 = {"ok":false,"error_code":405,"description":"Bad Request: method not allowed"};
 const ERROR_406 = {"ok":false,"error_code":406,"description":"Bad Request: file type invalid"};
 const ERROR_407 = {"ok":false,"error_code":407,"description":"Bad Request: file hash invalid by atob"};
-const ERROR_408 = {"ok":false,"error_code":408,"description":"Bad Request: mode not in [attachment, inline]"};
+const ERROR_408 = {"ok":false,"error_code":408,"description":"Bad Request: mode not in [attachment, inline, stream]"};
+const ERROR_409 = {"ok":false,"error_code":409,"description":"Bad Request: file size exceeds maximum allowed limit"};
+const ERROR_410 = {"ok":false,"error_code":410,"description":"Bad Request: file size exceeds streaming limit (2GB max)"};
 
 // ---------- Event Listener ---------- // 
 
@@ -48,6 +56,19 @@ async function handleRequest(event) {
 
     const channel_id = BOT_CHANNEL;
     const file_id = await Cryptic.deHash(file);
+    
+    // Validate file size before retrieving
+    const fileInfo = await getFileInfo(channel_id, file_id);
+    if (fileInfo.error_code) {return await Raise(fileInfo, fileInfo.error_code)};
+    
+    const fSize = fileInfo.size;
+    const fType = fileInfo.type;
+    
+    // Check size limits based on mode
+    if (fSize > MAX_STREAM_SIZE && (mode === 'inline' || mode === 'attachment')) {
+        return Raise(ERROR_410, 413);
+    }
+    
     const retrieve = await RetrieveFile(channel_id, file_id);
     if (retrieve.error_code) {return await Raise(retrieve, retrieve.error_code)};
 
@@ -58,19 +79,48 @@ async function handleRequest(event) {
 
     // Handle range requests for streaming
     const range = event.request.headers.get('Range');
-    if (range && mode === 'inline') {
+    if (range && (mode === 'inline' || mode === 'stream')) {
         return handleRangeRequest(rdata, rname, rsize, rtype, range);
     }
 
     return new Response(rdata, {
         status: 200, headers: {
-            "Content-Disposition": `${mode}; filename=${rname}`,
+            "Content-Disposition": `${mode === 'stream' ? 'inline' : mode}; filename=${rname}`,
             "Content-Length": rsize,
             "Content-Type": rtype,
             "Accept-Ranges": "bytes",
             ...HEADERS_FILE
         }
     });
+}
+
+// ---------- Get File Info ---------- //
+
+async function getFileInfo(channel_id, message_id) {
+    let data = await Bot.editMessage(channel_id, message_id, await UUID());
+    if (data.error_code){return data}
+    
+    let fSize = 0;
+    let fType = "";
+    
+    if (data.document){
+        fSize = data.document.file_size;
+        fType = data.document.mime_type;
+    } else if (data.audio) {
+        fSize = data.audio.file_size;
+        fType = data.audio.mime_type;
+    } else if (data.video) {
+        fSize = data.video.file_size;
+        fType = data.video.mime_type;
+    } else if (data.photo) {
+        const fLen = data.photo.length - 1;
+        fSize = data.photo[fLen].file_size;
+        fType = "image/jpeg";
+    } else {
+        return ERROR_406
+    }
+    
+    return {size: fSize, type: fType};
 }
 
 // ---------- Retrieve File ---------- //
@@ -123,24 +173,51 @@ async function Raise(json_error, status_code) {
 // ---------- Range Request Handler ---------- //
 
 function handleRangeRequest(data, name, size, type, rangeHeader) {
-    const parts = rangeHeader.replace(/bytes=/, "").split("-");
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : size - 1;
-    const chunksize = (end - start) + 1;
-     
-    const buffer = new Uint8Array(data);
-    const chunk = buffer.slice(start, end + 1);
-     
-    return new Response(chunk, {
-        status: 206,
-        headers: {
-            "Content-Range": `bytes ${start}-${end}/${size}`,
-            "Accept-Ranges": "bytes",
-            "Content-Length": chunksize,
-            "Content-Type": type,
-            ...HEADERS_FILE
+    try {
+        const parts = rangeHeader.replace(/bytes=/, "").split("-");
+        const start = parseInt(parts[0], 10) || 0;
+        const end = parts[1] ? parseInt(parts[1], 10) : Math.min(start + CHUNK_SIZE - 1, size - 1);
+        
+        // Validate range
+        if (start >= size || end >= size || start > end) {
+            return new Response(JSON.stringify({
+                ok: false,
+                error_code: 416,
+                description: "Range Not Satisfiable"
+            }), {
+                status: 416,
+                headers: {
+                    "Content-Range": `bytes */${size}`,
+                    ...HEADERS_ERRR
+                }
+            });
         }
-    });
+        
+        const chunksize = (end - start) + 1;
+        const buffer = new Uint8Array(data);
+        const chunk = buffer.slice(start, end + 1);
+        
+        return new Response(chunk, {
+            status: 206,
+            headers: {
+                "Content-Range": `bytes ${start}-${end}/${size}`,
+                "Accept-Ranges": "bytes",
+                "Content-Length": chunksize.toString(),
+                "Content-Type": type,
+                "Cache-Control": "public, max-age=86400",
+                ...HEADERS_FILE
+            }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({
+            ok: false,
+            error_code: 500,
+            description: "Internal Server Error: " + error.message
+        }), {
+            status: 500,
+            headers: HEADERS_ERRR
+        });
+    }
 }
 
 // ---------- Helper: File Size Formatter ---------- //
@@ -704,18 +781,46 @@ async function onMessage(event, message) {
         fName = message.document.file_name;
         fType = message.document.mime_type.split("/")[0];
         fSize = message.document.file_size;
+        
+        // Check file size limit for Telegram
+        if (fSize > MAX_TELEGRAM_SIZE) {
+            return Bot.sendMessage(message.chat.id, message.message_id, 
+                `❌ *ғɪʟᴇ ᴛᴏᴏ ʟᴀʀɢᴇ*\n\n` +
+                `📊 *ғɪʟᴇ sɪᴢᴇ:* \`${formatSize(fSize)}\`\n` +
+                `⚠️ *ᴍᴀx ᴀʟʟᴏᴡᴇᴅ:* \`4.00 GB\`\n\n` +
+                `Please send a smaller file.`);
+        }
+        
         fSave = await Bot.sendDocument(BOT_CHANNEL, fID)
     } else if (message.audio) {
         fID = message.audio.file_id;
         fName = message.audio.file_name || "Audio File";
         fType = message.audio.mime_type.split("/")[0];
         fSize = message.audio.file_size;
+        
+        if (fSize > MAX_TELEGRAM_SIZE) {
+            return Bot.sendMessage(message.chat.id, message.message_id, 
+                `❌ *ғɪʟᴇ ᴛᴏᴏ ʟᴀʀɢᴇ*\n\n` +
+                `📊 *ғɪʟᴇ sɪᴢᴇ:* \`${formatSize(fSize)}\`\n` +
+                `⚠️ *ᴍᴀx ᴀʟʟᴏᴡᴇᴅ:* \`4.00 GB\`\n\n` +
+                `Please send a smaller file.`);
+        }
+        
         fSave = await Bot.sendDocument(BOT_CHANNEL, fID)
     } else if (message.video) {
         fID = message.video.file_id;
         fName = message.video.file_name || "Video File";
         fType = message.video.mime_type.split("/")[0];
         fSize = message.video.file_size;
+        
+        if (fSize > MAX_TELEGRAM_SIZE) {
+            return Bot.sendMessage(message.chat.id, message.message_id, 
+                `❌ *ғɪʟᴇ ᴛᴏᴏ ʟᴀʀɢᴇ*\n\n` +
+                `📊 *ғɪʟᴇ sɪᴢᴇ:* \`${formatSize(fSize)}\`\n` +
+                `⚠️ *ᴍᴀx ᴀʟʟᴏᴡᴇᴅ:* \`4.00 GB\`\n\n` +
+                `Please send a smaller file.`);
+        }
+        
         fSave = await Bot.sendDocument(BOT_CHANNEL, fID)
     } else if (message.photo) {
         fID = message.photo[message.photo.length - 1].file_id;
@@ -725,7 +830,7 @@ async function onMessage(event, message) {
         fSave = await Bot.sendPhoto(BOT_CHANNEL, fID)
     } else {
         const buttons = [[{ text: "Source Code", url: "https://github.com/vauth/filestream-cf" }]];
-        return Bot.sendMessage(message.chat.id, message.message_id, "Send me any file/video/gif/audio *(t<=4GB, e<=20MB)*.", buttons)
+        return Bot.sendMessage(message.chat.id, message.message_id, "Send me any file/video/gif/audio *(max 4GB)*.", buttons)
     }
 
     // 6. Check if Forwarding Failed
@@ -747,6 +852,11 @@ async function onMessage(event, message) {
         const vlc_link = `vlc://${url.origin.replace('https://', '').replace('http://', '')}/?file=${final_hash}&mode=inline`
         const mx_link = `intent:${final_stre}#Intent;package=com.mxtech.videoplayer.ad;end`
         const formattedSize = formatSize(fSize);
+        
+        // Check if file exceeds streaming limit
+        const streamWarning = fSize > MAX_STREAM_SIZE 
+            ? `\n\n⚠️ *ɴᴏᴛᴇ:* Direct download/stream links work best for files under 2GB. Use Telegram link for larger files.` 
+            : '';
 
         const buttons = [
             [{ text: "🌐 sᴛʀᴇᴀᴍ ᴘᴀɢᴇ", url: final_page }],
@@ -760,7 +870,8 @@ async function onMessage(event, message) {
                          `📂 *ғɪʟᴇ ɴᴀᴍᴇ:* \`${fName}\`\n` +
                          `💾 *ғɪʟᴇ sɪᴢᴇ:* \`${formattedSize}\`\n` +
                          `📊 *ғɪʟᴇ ᴛʏᴘᴇ:* \`${fType}\`\n\n` +
-                         `*🔐 sᴇᴄᴜʀᴇ ʟɪɴᴋ:* \`${final_page}\``;
+                         `*🔐 sᴇᴄᴜʀᴇ ʟɪɴᴋ:* \`${final_page}\`` +
+                         streamWarning;
 
         return Bot.sendMessage(message.chat.id, message.message_id, final_text, buttons)
 
