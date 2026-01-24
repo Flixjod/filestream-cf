@@ -1,14 +1,16 @@
 // ---------- Insert Your Data ---------- //
 
-const BOT_TOKEN = "BOT_TOKEN"; // Insert your bot token.
+const BOT_TOKEN = "8146769699:AAFjMg0sJ649cD0ONWSovCw5cS71bwM6LDE"; // Insert your bot token.
 const BOT_WEBHOOK = "/endpoint"; // Let it be as it is.
-const BOT_SECRET = "BOT_SECRET"; // Insert a powerful secret text (only [A-Z, a-z, 0-9, _, -] are allowed).
-const BOT_OWNER = 123456789; // Insert your telegram account id.
-const BOT_CHANNEL = -100123456789; // Insert your telegram channel id which the bot is admin in.
-const SIA_SECRET = "SIA_SECRET"; // Insert a powerful secret text and keep it safe.
-const PUBLIC_BOT = false; // Make your bot public (only [true, false] are allowed).
-const OWNER_USERNAME = "FLiX_LY"; // Insert your telegram username for credits.
-const BOT_NAME = "FileStream Bot"; // Insert your bot display name.
+const BOT_SECRET = "ZPkwfwz694fxhahRx9VY"; // Insert a powerful secret text.
+const BOT_OWNER = 1008848605; // Insert your telegram account id.
+const BOT_CHANNEL = -1002199235178; // Insert your channel id.
+const SIA_SECRET = "abBGwkjXV3zqmsAkf9Mx"; // Insert a powerful secret text.
+const PUBLIC_BOT = false; // Make your bot public?
+const OWNER_USERNAME = "FLiX_LY"; // Insert your username.
+const BOT_NAME = "FileStream Bot"; // Bot Name.
+
+
 
 
 // ---------- Do Not Modify ---------- // 
@@ -16,11 +18,19 @@ const BOT_NAME = "FileStream Bot"; // Insert your bot display name.
 const WHITE_METHODS = ["GET", "POST", "HEAD"];
 const HEADERS_FILE = {"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type"};
 const HEADERS_ERRR = {'Access-Control-Allow-Origin': '*', 'content-type': 'application/json'};
+
+// File size limits in bytes
+const MAX_TELEGRAM_SIZE = 4 * 1024 * 1024 * 1024; // 4GB for Telegram/Inline
+const MAX_STREAM_SIZE = 2 * 1024 * 1024 * 1024; // 2GB for direct stream/download
+const CHUNK_SIZE = 1024 * 1024; // 1MB chunks for streaming
+
 const ERROR_404 = {"ok":false,"error_code":404,"description":"Bad Request: missing /?file= parameter", "credit": "https://github.com/vauth/filestream-cf"};
 const ERROR_405 = {"ok":false,"error_code":405,"description":"Bad Request: method not allowed"};
 const ERROR_406 = {"ok":false,"error_code":406,"description":"Bad Request: file type invalid"};
 const ERROR_407 = {"ok":false,"error_code":407,"description":"Bad Request: file hash invalid by atob"};
-const ERROR_408 = {"ok":false,"error_code":408,"description":"Bad Request: mode not in [attachment, inline]"};
+const ERROR_408 = {"ok":false,"error_code":408,"description":"Bad Request: mode not in [attachment, inline, stream]"};
+const ERROR_409 = {"ok":false,"error_code":409,"description":"Bad Request: file size exceeds maximum allowed limit"};
+const ERROR_410 = {"ok":false,"error_code":410,"description":"Bad Request: file size exceeds streaming limit (2GB max)"};
 
 // ---------- Event Listener ---------- // 
 
@@ -32,13 +42,15 @@ async function handleRequest(event) {
     const url = new URL(event.request.url);
     const file = url.searchParams.get('file');
     const mode = url.searchParams.get('mode') || "attachment";
-    const d = url.searchParams.get('d'); 
-     
+    
     if (url.pathname === BOT_WEBHOOK) {return Bot.handleWebhook(event)}
     if (url.pathname === '/registerWebhook') {return Bot.registerWebhook(event, url, BOT_WEBHOOK, BOT_SECRET)}
     if (url.pathname === '/unregisterWebhook') {return Bot.unregisterWebhook(event)}
     if (url.pathname === '/getMe') {return new Response(JSON.stringify(await Bot.getMe()), {headers: HEADERS_ERRR, status: 202})}
-    if (url.pathname === '/') {return new Response(await getHomePage(), {headers: {'Content-Type': 'text/html'}})}
+    
+    // Only show Home Page if NO file is requested
+    if (url.pathname === '/' && !file) {return new Response(await getHomePage(), {headers: {'Content-Type': 'text/html'}})}
+    
     if (url.pathname === '/stream' && file) {return new Response(await getStreamPage(url, file), {headers: {'Content-Type': 'text/html'}})}
 
     if (!file) {return Raise(ERROR_404, 404);}
@@ -48,6 +60,19 @@ async function handleRequest(event) {
 
     const channel_id = BOT_CHANNEL;
     const file_id = await Cryptic.deHash(file);
+    
+    // Validate file size before retrieving
+    const fileInfo = await getFileInfo(channel_id, file_id);
+    if (fileInfo.error_code) {return await Raise(fileInfo, fileInfo.error_code)};
+    
+    const fSize = fileInfo.size;
+    const fType = fileInfo.type;
+    
+    // Check size limits based on mode
+    if (fSize > MAX_STREAM_SIZE && (mode === 'inline' || mode === 'attachment')) {
+        return Raise(ERROR_410, 413);
+    }
+    
     const retrieve = await RetrieveFile(channel_id, file_id);
     if (retrieve.error_code) {return await Raise(retrieve, retrieve.error_code)};
 
@@ -58,19 +83,64 @@ async function handleRequest(event) {
 
     // Handle range requests for streaming
     const range = event.request.headers.get('Range');
-    if (range && mode === 'inline') {
+    if (range && (mode === 'inline' || mode === 'stream')) {
         return handleRangeRequest(rdata, rname, rsize, rtype, range);
     }
 
     return new Response(rdata, {
         status: 200, headers: {
-            "Content-Disposition": `${mode}; filename=${rname}`,
+            "Content-Disposition": `${mode === 'stream' ? 'inline' : mode}; filename=${rname}`,
             "Content-Length": rsize,
             "Content-Type": rtype,
             "Accept-Ranges": "bytes",
             ...HEADERS_FILE
         }
     });
+}
+
+// ---------- Helper: Markdown Sanitizer ---------- //
+function escapeMarkdown(text) {
+    if (!text) return 'Unknown File';
+    return text.replace(/`/g, "'");
+}
+
+
+// ---------- Helper: File Size Formatter ---------- //
+function formatSize(bytes) {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+// ---------- Get File Info ---------- //
+
+async function getFileInfo(channel_id, message_id) {
+    let data = await Bot.editMessage(channel_id, message_id, await UUID());
+    if (data.error_code){return data}
+    
+    let fSize = 0;
+    let fType = "";
+    
+    if (data.document){
+        fSize = data.document.file_size;
+        fType = data.document.mime_type;
+    } else if (data.audio) {
+        fSize = data.audio.file_size;
+        fType = data.audio.mime_type;
+    } else if (data.video) {
+        fSize = data.video.file_size;
+        fType = data.video.mime_type;
+    } else if (data.photo) {
+        const fLen = data.photo.length - 1;
+        fSize = data.photo[fLen].file_size;
+        fType = "image/jpeg";
+    } else {
+        return ERROR_406
+    }
+    
+    return {size: fSize, type: fType};
 }
 
 // ---------- Retrieve File ---------- //
@@ -123,33 +193,35 @@ async function Raise(json_error, status_code) {
 // ---------- Range Request Handler ---------- //
 
 function handleRangeRequest(data, name, size, type, rangeHeader) {
-    const parts = rangeHeader.replace(/bytes=/, "").split("-");
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : size - 1;
-    const chunksize = (end - start) + 1;
-     
-    const buffer = new Uint8Array(data);
-    const chunk = buffer.slice(start, end + 1);
-     
-    return new Response(chunk, {
-        status: 206,
-        headers: {
-            "Content-Range": `bytes ${start}-${end}/${size}`,
-            "Accept-Ranges": "bytes",
-            "Content-Length": chunksize,
-            "Content-Type": type,
-            ...HEADERS_FILE
+    try {
+        const parts = rangeHeader.replace(/bytes=/, "").split("-");
+        const start = parseInt(parts[0], 10) || 0;
+        const end = parts[1] ? parseInt(parts[1], 10) : Math.min(start + CHUNK_SIZE - 1, size - 1);
+        
+        if (start >= size || end >= size || start > end) {
+            return new Response(JSON.stringify({
+                ok: false, error_code: 416, description: "Range Not Satisfiable"
+            }), { status: 416, headers: { "Content-Range": `bytes */${size}`, ...HEADERS_ERRR } });
         }
-    });
-}
-
-// ---------- Helper: File Size Formatter ---------- //
-function formatSize(bytes) {
-    if (bytes === 0) return '0 B';
-    const k = 1024;
-    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        
+        const chunksize = (end - start) + 1;
+        const buffer = new Uint8Array(data);
+        const chunk = buffer.slice(start, end + 1);
+        
+        return new Response(chunk, {
+            status: 206,
+            headers: {
+                "Content-Range": `bytes ${start}-${end}/${size}`,
+                "Accept-Ranges": "bytes",
+                "Content-Length": chunksize.toString(),
+                "Content-Type": type,
+                "Cache-Control": "public, max-age=86400",
+                ...HEADERS_FILE
+            }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ok: false, error_code: 500, description: "Internal Server Error"}), {status: 500, headers: HEADERS_ERRR});
+    }
 }
 
 // ---------- Stream Page Generator ---------- //
@@ -160,7 +232,6 @@ async function getStreamPage(url, fileHash) {
     const downloadUrl = `${url.origin}/?file=${fileHash}`;
     const telegramUrl = `https://t.me/${bot.username}/?start=${fileHash}`;
      
-    // Get file info
     let fileName = 'Media File';
     let fileType = 'video';
     try {
@@ -530,6 +601,17 @@ class Bot {
     if (response.status == 200) {return (await response.json()).result;
     } else {return await response.json()}
   }
+  
+  static async copyMessage(chat_id, from_chat_id, message_id, reply_markup=[]) {
+    const response = await fetch(await this.apiUrl('copyMessage', {
+        chat_id: chat_id, 
+        from_chat_id: from_chat_id, 
+        message_id: message_id,
+        reply_markup: JSON.stringify({inline_keyboard: reply_markup})
+    }));
+    if (response.status == 200) {return (await response.json()).result;
+    } else {return await response.json()}
+  }
 
   static async editMessage(channel_id, message_id, caption_text) {
       const response = await fetch(await this.apiUrl('editMessageCaption', {chat_id: channel_id, message_id: message_id, caption: caption_text}))
@@ -587,7 +669,7 @@ async function onInline(event, inline) {
   let  fID; let fName; let fType; let fSize; let fLen;
 
   if (!PUBLIC_BOT && inline.from.id != BOT_OWNER) {
-    const buttons = [[{ text: "Source Code", url: "https://github.com/vauth/filestream-cf" }]];
+    const buttons = [[{ text: "Source Code", url: "https://t.me/FLiX_LY" }]];
     return await Bot.answerInlineArticle(inline.id, "Access forbidden", "Deploy your own filestream-cf.", "*❌ ᴀᴄᴄᴇss ғᴏʀʙɪᴅᴅᴇɴ.*\n📡 Deploy your own [filestream-cf](https://github.com/vauth/filestream-cf) bot.", buttons)
   }
  
@@ -601,7 +683,7 @@ async function onInline(event, inline) {
   const data = await Bot.editMessage(channel_id, message_id, await UUID());
 
   if (data.error_code){
-    const buttons = [[{ text: "Source Code", url: "https://github.com/vauth/filestream-cf" }]];
+    const buttons = [[{ text: "Source Code", url: "https://t.me/FLiX_LY" }]];
     return await Bot.answerInlineArticle(inline.id, "Error", data.description, data.description, buttons)
   }
 
@@ -660,7 +742,7 @@ async function onMessage(event, message) {
     if (message.text && (message.text === "/start" || message.text.startsWith("/start "))) {
         // Plain start
         if (message.text === "/start") {
-             const buttons = [[{ text: "👨‍💻 Source Code", url: "https://github.com/vauth/filestream-cf" }]];
+             const buttons = [[{ text: "👨‍💻 Source Code", url: "https://t.me/FLiX_LY" }]];
              const startText = `👋 *ʜᴇʟʟᴏ ${message.from.first_name}*,\n\nI am a *ᴘʀᴇᴍɪᴜᴍ ғɪʟᴇ sᴛʀᴇᴀᴍ ʙᴏᴛ*.\n\n📂 *Send me any file* (Video, Audio, Document) and I will generate a direct download and streaming link for you.`;
              return Bot.sendMessage(message.chat.id, message.message_id, startText, buttons);
         }
@@ -694,38 +776,48 @@ async function onMessage(event, message) {
 
     // 4. Access Control
     if (!PUBLIC_BOT && message.chat.id != BOT_OWNER) {
-        const buttons = [[{ text: "Source Code", url: "https://github.com/vauth/filestream-cf" }]];
-        return Bot.sendMessage(message.chat.id, message.message_id, "*❌ ᴀᴄᴄᴇss ғᴏʀʙɪᴅᴅᴇɴ.*\n📡 Deploy your own [filestream-cf](https://github.com/vauth/filestream-cf) bot.", buttons)
+        const buttons = [[{ text: "Source Code", url: "https://t.me/FLiX_LY" }]];
+        return Bot.sendMessage(message.chat.id, message.message_id, "*❌ ᴀᴄᴄᴇss ғᴏʀʙɪᴅᴅᴇɴ.*\n📡 Deploy your own [filestream-cf](https://t.me/FLiX_LY) bot.", buttons)
     }
 
-    // 5. Detect File Type
-    if (message.document) {
-        fID = message.document.file_id;
-        fName = message.document.file_name;
-        fType = message.document.mime_type.split("/")[0];
-        fSize = message.document.file_size;
-        fSave = await Bot.sendDocument(BOT_CHANNEL, fID)
-    } else if (message.audio) {
-        fID = message.audio.file_id;
-        fName = message.audio.file_name || "Audio File";
-        fType = message.audio.mime_type.split("/")[0];
-        fSize = message.audio.file_size;
-        fSave = await Bot.sendDocument(BOT_CHANNEL, fID)
-    } else if (message.video) {
-        fID = message.video.file_id;
-        fName = message.video.file_name || "Video File";
-        fType = message.video.mime_type.split("/")[0];
-        fSize = message.video.file_size;
-        fSave = await Bot.sendDocument(BOT_CHANNEL, fID)
-    } else if (message.photo) {
-        fID = message.photo[message.photo.length - 1].file_id;
-        fName = message.photo[message.photo.length - 1].file_unique_id + '.jpg';
-        fType = "image";
-        fSize = message.photo[message.photo.length - 1].file_size;
-        fSave = await Bot.sendPhoto(BOT_CHANNEL, fID)
+    // 5. Detect File Type & Copy to Channel
+    if (message.document || message.audio || message.video || message.photo) {
+        
+        // --- 5a. Extract Metadata ---
+        if (message.document) {
+            fName = message.document.file_name || "Document";
+            fType = message.document.mime_type ? message.document.mime_type.split("/")[0] : "document";
+            fSize = message.document.file_size;
+        } else if (message.audio) {
+            fName = message.audio.file_name || "Audio File";
+            fType = message.audio.mime_type ? message.audio.mime_type.split("/")[0] : "audio";
+            fSize = message.audio.file_size;
+        } else if (message.video) {
+            fName = message.video.file_name || "Video File";
+            fType = message.video.mime_type ? message.video.mime_type.split("/")[0] : "video";
+            fSize = message.video.file_size;
+        } else if (message.photo) {
+            const uniqueId = message.photo[message.photo.length - 1].file_unique_id;
+            fName = `${uniqueId}.jpg`;
+            fType = "image";
+            fSize = message.photo[message.photo.length - 1].file_size;
+        }
+
+        // --- 5b. Size Check ---
+        if (fSize > MAX_TELEGRAM_SIZE) {
+            return Bot.sendMessage(message.chat.id, message.message_id, 
+                `❌ *ғɪʟᴇ ᴛᴏᴏ ʟᴀʀɢᴇ*\n\n` +
+                `📊 *ғɪʟᴇ sɪᴢᴇ:* \`${formatSize(fSize)}\`\n` +
+                `⚠️ *ᴍᴀx ᴀʟʟᴏᴡᴇᴅ:* \`4.00 GB\`\n\n` +
+                `Please send a smaller file.`);
+        }
+
+        // --- 5c. Copy the Message to Channel ---
+        fSave = await Bot.copyMessage(BOT_CHANNEL, message.chat.id, message.message_id);
+
     } else {
         const buttons = [[{ text: "Source Code", url: "https://github.com/vauth/filestream-cf" }]];
-        return Bot.sendMessage(message.chat.id, message.message_id, "Send me any file/video/gif/audio *(t<=4GB, e<=20MB)*.", buttons)
+        return Bot.sendMessage(message.chat.id, message.message_id, "Send me any file/video/gif/audio *(max 4GB)*.", buttons)
     }
 
     // 6. Check if Forwarding Failed
@@ -733,38 +825,68 @@ async function onMessage(event, message) {
         return Bot.sendMessage(message.chat.id, message.message_id, "❌ Error forwarding to channel:\n" + fSave.description);
     }
 
-    // 7. Generate Links
+    // 7. Generate Links & Buttons
     try {
         if (!fSave.message_id) {
             return Bot.sendMessage(message.chat.id, message.message_id, "❌ Error: Channel did not return a message ID.");
         }
 
         const final_hash = await Cryptic.Hash(fSave.message_id);
-        const final_link = `${url.origin}/?file=${final_hash}`
-        const final_stre = `${url.origin}/?file=${final_hash}&mode=inline`
-        const final_page = `${url.origin}/stream?file=${final_hash}`
-        const final_tele = `https://t.me/${bot.username}/?start=${final_hash}`
-        const vlc_link = `vlc://${url.origin.replace('https://', '').replace('http://', '')}/?file=${final_hash}&mode=inline`
-        const mx_link = `intent:${final_stre}#Intent;package=com.mxtech.videoplayer.ad;end`
+        const final_link = `${url.origin}/?file=${final_hash}`;
+        const final_tele = `https://t.me/${bot.username}/?start=${final_hash}`;
+        const stream_page = `${url.origin}/stream?file=${final_hash}`;
         const formattedSize = formatSize(fSize);
+        
+        // Determine if file is streamable (Video or Audio)
+        const isStreamable = (fType === 'video' || fType === 'audio');
 
-        const buttons = [
-            [{ text: "🌐 sᴛʀᴇᴀᴍ ᴘᴀɢᴇ", url: final_page }],
-            [{ text: "📥 ᴅᴏᴡɴʟᴏᴀᴅ", url: final_link }, { text: "🔗 ᴄᴏᴘʏ ʟɪɴᴋ", url: final_stre }],
-            [{ text: "▶️ ᴠʟᴄ ᴘʟᴀʏᴇʀ", url: vlc_link }, { text: "📱 ᴍx ᴘʟᴀʏᴇʀ", url: mx_link }],
-            [{ text: "💬 ᴛᴇʟᴇɢʀᴀᴍ", url: final_tele }, { text: "🔁 sʜᴀʀᴇ", switch_inline_query: final_hash }],
-            [{ text: "👑 ᴏᴡɴᴇʀ", url: `https://t.me/${OWNER_USERNAME}` }]
-        ];
+        // --- Define Buttons ---
+        const btnStream = { text: "🌐 sᴛʀᴇᴀᴍ ᴘᴀɢᴇ", url: stream_page };
+        const btnDownload = { text: "📥 ᴅᴏᴡɴʟᴏᴀᴅ", url: final_link };
+        const btnTele = { text: "💬 ᴛᴇʟᴇɢʀᴀᴍ", url: final_tele };
+        const btnShare = { text: "🔁 sʜᴀʀᴇ", switch_inline_query: final_hash };
+        const btnOwner = { text: "👑 ᴏᴡɴᴇʀ", url: `https://t.me/${OWNER_USERNAME}` };
 
-        let final_text = `*✨ ɴᴇᴡ ғɪʟᴇ ɢᴇɴᴇʀᴀᴛᴇᴅ*\n\n` +
-                         `📂 *ғɪʟᴇ ɴᴀᴍᴇ:* \`${fName}\`\n` +
-                         `💾 *ғɪʟᴇ sɪᴢᴇ:* \`${formattedSize}\`\n` +
-                         `📊 *ғɪʟᴇ ᴛʏᴘᴇ:* \`${fType}\`\n\n` +
-                         `*🔐 sᴇᴄᴜʀᴇ ʟɪɴᴋ:* \`${final_page}\``;
+        let buttons = [];
 
-        return Bot.sendMessage(message.chat.id, message.message_id, final_text, buttons)
+        if (isStreamable) {
+            buttons = [
+                [btnStream, btnDownload],
+                [btnTele, btnShare],
+                [btnOwner]
+            ];
+        } else {
+            // If it's a document/zip/exe, don't show Stream or VLC buttons
+            buttons = [
+                [btnDownload, btnTele],
+                [btnShare],
+                [btnOwner]
+            ];
+        }
+
+        // --- Define Message Text ---
+        // Escape the filename to prevent markdown errors!
+        const safeName = escapeMarkdown(fName);
+        
+        let final_text = `✅ *ғɪʟᴇ sᴜᴄᴄᴇssғᴜʟʟʏ ᴘʀᴏᴄᴇssᴇᴅ!*\n\n` +
+            `📂 *ғɪʟᴇ ɴᴀᴍᴇ:* \`${safeName}\`\n` +
+            `💾 *ғɪʟᴇ sɪᴢᴇ:* \`${formattedSize}\`\n` +
+            `📊 *ғɪʟᴇ ᴛʏᴘᴇ:* \`${fType}\`\n`;
+
+        if (isStreamable) {
+            final_text += `🎬 *sᴛʀᴇᴀᴍɪɴɢ:* \`Available\`\n\n`;
+            final_text += `🔗 *sᴛʀᴇᴀᴍ ʟɪɴᴋ:*\n\`${stream_page}\``;
+            
+            if (fSize > MAX_STREAM_SIZE) {
+                final_text += `\n\n⚠️ *ɴᴏᴛᴇ:* Streaming works best for files under 2GB.`;
+            }
+        } else {
+            final_text += `\n🔗 *ᴅᴏᴡɴʟᴏᴀᴅ ʟɪɴᴋ:*\n\`${final_link}\``;
+        }
+
+        return Bot.sendMessage(message.chat.id, message.message_id, final_text, buttons);
 
     } catch (error) {
         return Bot.sendMessage(message.chat.id, message.message_id, "❌ **Critical Error:**\n" + error.message);
     }
-}}}
+}
