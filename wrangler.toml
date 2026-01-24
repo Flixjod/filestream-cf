@@ -2,3 +2,14 @@ name = "streamfile-cf"
 main = "worker.js"
 compatibility_date = "2024-05-29"
 compatibility_flags = ["nodejs_compat"]
+
+# D1 Database Binding
+# To use D1, you need to create a database first:
+# wrangler d1 create filestream-db
+# Then update the database_id below with the ID from the output
+[[d1_databases]]
+binding = "DB"
+database_name = "filestream-db"
+database_id = "your-database-id-here"
+# Note: Replace "your-database-id-here" with your actual D1 database ID
+# You can find it by running: wrangler d1 list

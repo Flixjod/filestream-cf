@@ -23,6 +23,7 @@ const HEADERS_ERRR = {'Access-Control-Allow-Origin': '*', 'content-type': 'appli
 const MAX_TELEGRAM_SIZE = 4 * 1024 * 1024 * 1024; // 4GB for Telegram/Inline
 const MAX_STREAM_SIZE = 2 * 1024 * 1024 * 1024; // 2GB for direct stream/download
 const CHUNK_SIZE = 1024 * 1024; // 1MB chunks for streaming
+const TELEGRAM_CHUNK_SIZE = 512 * 1024; // 512KB chunks for Telegram API requests
 
 const ERROR_404 = {"ok":false,"error_code":404,"description":"Bad Request: missing /?file= parameter", "credit": "https://github.com/vauth/filestream-cf"};
 const ERROR_405 = {"ok":false,"error_code":405,"description":"Bad Request: method not allowed"};
@@ -112,25 +113,28 @@ async function handleRequest(event) {
     const retrieve = await RetrieveFile(channel_id, file_id);
     if (retrieve.error_code) {return await Raise(retrieve, retrieve.error_code)};
 
-    const rdata = retrieve[0]
+    const rpath = retrieve[0]
     const rname = retrieve[1]
     const rsize = retrieve[2]
     const rtype = retrieve[3]
 
-    // Handle range requests for streaming
+    // Stream the file directly from Telegram without loading into memory
     const range = event.request.headers.get('Range');
-    if (range && (mode === 'inline' || mode === 'stream')) {
-        return handleRangeRequest(rdata, rname, rsize, rtype, range);
-    }
-
-    return new Response(rdata, {
-        status: 200, headers: {
-            "Content-Disposition": `${mode === 'stream' ? 'inline' : mode}; filename=${rname}`,
-            "Content-Length": rsize,
-            "Content-Type": rtype,
-            "Accept-Ranges": "bytes",
-            ...HEADERS_FILE
-        }
+    const telegramResponse = await streamFileFromTelegram(rpath, range);
+    
+    // Clone the response and modify headers
+    const headers = new Headers(telegramResponse.headers);
+    headers.set("Content-Disposition", `${mode === 'stream' ? 'inline' : mode}; filename=${rname}`);
+    headers.set("Content-Type", rtype);
+    headers.set("Accept-Ranges", "bytes");
+    headers.set("Access-Control-Allow-Origin", "*");
+    headers.set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
+    headers.set("Access-Control-Allow-Headers", "Content-Type");
+    headers.set("Cache-Control", "public, max-age=3600");
+    
+    return new Response(telegramResponse.body, {
+        status: telegramResponse.status,
+        headers: headers
     });
 }
 
@@ -401,7 +405,23 @@ async function RetrieveFile(channel_id, message_id) {
     const file = await Bot.getFile(fID)
     if (file.error_code){return file}
 
-    return [await Bot.fetchFile(file.file_path), fName, fSize, fType];
+    // Return file info instead of full file data for streaming
+    return [file.file_path, fName, fSize, fType];
+}
+
+// ---------- Stream File from Telegram ---------- //
+
+async function streamFileFromTelegram(filePath, rangeHeader) {
+    const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+    
+    // Forward the range request to Telegram
+    const headers = {};
+    if (rangeHeader) {
+        headers['Range'] = rangeHeader;
+    }
+    
+    const response = await fetch(fileUrl, { headers });
+    return response;
 }
 
 // ---------- Raise Error ---------- //
@@ -410,39 +430,8 @@ async function Raise(json_error, status_code) {
     return new Response(JSON.stringify(json_error), { headers: HEADERS_ERRR, status: status_code });
 }
 
-// ---------- Range Request Handler ---------- //
-
-function handleRangeRequest(data, name, size, type, rangeHeader) {
-    try {
-        const parts = rangeHeader.replace(/bytes=/, "").split("-");
-        const start = parseInt(parts[0], 10) || 0;
-        const end = parts[1] ? parseInt(parts[1], 10) : Math.min(start + CHUNK_SIZE - 1, size - 1);
-        
-        if (start >= size || end >= size || start > end) {
-            return new Response(JSON.stringify({
-                ok: false, error_code: 416, description: "Range Not Satisfiable"
-            }), { status: 416, headers: { "Content-Range": `bytes */${size}`, ...HEADERS_ERRR } });
-        }
-        
-        const chunksize = (end - start) + 1;
-        const buffer = new Uint8Array(data);
-        const chunk = buffer.slice(start, end + 1);
-        
-        return new Response(chunk, {
-            status: 206,
-            headers: {
-                "Content-Range": `bytes ${start}-${end}/${size}`,
-                "Accept-Ranges": "bytes",
-                "Content-Length": chunksize.toString(),
-                "Content-Type": type,
-                "Cache-Control": "public, max-age=86400",
-                ...HEADERS_FILE
-            }
-        });
-    } catch (error) {
-        return new Response(JSON.stringify({ok: false, error_code: 500, description: "Internal Server Error"}), {status: 500, headers: HEADERS_ERRR});
-    }
-}
+// ---------- Range Request Handler (Legacy - not used anymore) ---------- //
+// Now using direct streaming from Telegram API
 
 // ---------- Stream Page Generator ---------- //
 
@@ -1225,78 +1214,91 @@ async function UUID() {
     });
 }
 
-// ---------- Hash Generator ---------- //
+// ---------- Secure Hash Generator with HMAC-SHA256 ---------- //
 
 class Cryptic {
-  static async getSalt(length = 16) {
-    const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    let salt = '';
+  // Generate cryptographically secure random token
+  static async generateRandomToken(length = 16) {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    const randomValues = crypto.getRandomValues(new Uint8Array(length));
+    let token = '';
     for (let i = 0; i < length; i++) {
-        salt += characters.charAt(Math.floor(Math.random() * characters.length));
+        token += chars[randomValues[i] % chars.length];
     }
-    return salt;
+    return token;
   }
 
-  static async getKey(salt, iterations = 1000, keyLength = 32) {
-    const key = new Uint8Array(keyLength);
-    for (let i = 0; i < keyLength; i++) {
-        key[i] = (SIA_SECRET.charCodeAt(i % SIA_SECRET.length) + salt.charCodeAt(i % salt.length)) % 256;
-    }
-    for (let j = 0; j < iterations; j++) {
-        for (let i = 0; i < keyLength; i++) {
-            key[i] = (key[i] + SIA_SECRET.charCodeAt(i % SIA_SECRET.length) + salt.charCodeAt(i % salt.length)) % 256;
-        }
-    }
-    return key;
+  // Generate HMAC-SHA256 signature
+  static async hmacSHA256(message, secret) {
+    const encoder = new TextEncoder();
+    const keyData = encoder.encode(secret);
+    const messageData = encoder.encode(message);
+    
+    const key = await crypto.subtle.importKey(
+        'raw',
+        keyData,
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['sign']
+    );
+    
+    const signature = await crypto.subtle.sign('HMAC', key, messageData);
+    return this.arrayBufferToBase64(signature);
   }
 
-  static async baseEncode(input) {
-    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-    let output = '';
-    let buffer = 0;
-    let bitsLeft = 0;
-    for (let i = 0; i < input.length; i++) {
-        buffer = (buffer << 8) | input.charCodeAt(i);
-        bitsLeft += 8;
-        while (bitsLeft >= 5) {output += alphabet[(buffer >> (bitsLeft - 5)) & 31]; bitsLeft -= 5}
+  // Convert ArrayBuffer to Base64
+  static arrayBufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    for (let i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i]);
     }
-    if (bitsLeft > 0) {output += alphabet[(buffer << (5 - bitsLeft)) & 31]}
-    return output;
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
   }
 
-  static async baseDecode(input) {
-    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-    const lookup = {};
-    for (let i = 0; i < alphabet.length; i++) {lookup[alphabet[i]] = i}
-    let buffer = 0;
-    let bitsLeft = 0;
-    let output = '';
-    for (let i = 0; i < input.length; i++) {
-        buffer = (buffer << 5) | lookup[input[i]];
-        bitsLeft += 5;
-        if (bitsLeft >= 8) {output += String.fromCharCode((buffer >> (bitsLeft - 8)) & 255); bitsLeft -= 8}
+  // Convert Base64 to ArrayBuffer
+  static base64ToArrayBuffer(base64) {
+    base64 = base64.replace(/-/g, '+').replace(/_/g, '/');
+    while (base64.length % 4) {
+        base64 += '=';
     }
-    return output;
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes.buffer;
   }
 
+  // Generate secure hash: random_token + message_id + HMAC(random_token:message_id, secret)
   static async Hash(text) {
-    const salt = await this.getSalt();
-    const key = await this.getKey(salt);
-    const encoded = String(text).split('').map((char, index) => {
-        return String.fromCharCode(char.charCodeAt(0) ^ key[index % key.length]);
-    }).join('');
-    return await this.baseEncode(salt + encoded);
+    const randomToken = await this.generateRandomToken(12);
+    const payload = `${randomToken}:${text}`;
+    const signature = await this.hmacSHA256(payload, SIA_SECRET);
+    // Format: randomToken.messageId.signature (URL-safe)
+    return `${randomToken}.${text}.${signature.substring(0, 32)}`;
   }
 
+  // Verify and extract message_id from hash
   static async deHash(hashed) {
-    const decoded = await this.baseDecode(hashed);
-    const salt = decoded.substring(0, 16);
-    const encoded = decoded.substring(16);
-    const key = await this.getKey(salt);
-    const text = encoded.split('').map((char, index) => {
-        return String.fromCharCode(char.charCodeAt(0) ^ key[index % key.length]);
-    }).join('');
-    return text;
+    const parts = hashed.split('.');
+    if (parts.length !== 3) {
+        throw new Error('Invalid hash format');
+    }
+    
+    const randomToken = parts[0];
+    const messageId = parts[1];
+    const providedSignature = parts[2];
+    
+    // Verify HMAC signature
+    const payload = `${randomToken}:${messageId}`;
+    const expectedSignature = (await this.hmacSHA256(payload, SIA_SECRET)).substring(0, 32);
+    
+    if (providedSignature !== expectedSignature) {
+        throw new Error('Invalid signature - hash verification failed');
+    }
+    
+    return messageId;
   }
 }
 
