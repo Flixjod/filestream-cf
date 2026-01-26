@@ -23,6 +23,11 @@ const HEADERS_ERRR = {'Access-Control-Allow-Origin': '*', 'content-type': 'appli
 const MAX_TELEGRAM_SIZE = 4 * 1024 * 1024 * 1024; // 4GB for Telegram/Inline
 const MAX_STREAM_SIZE = 2 * 1024 * 1024 * 1024; // 2GB for direct stream/download
 const CHUNK_SIZE = 1024 * 1024; // 1MB chunks for streaming
+const TELEGRAM_CHUNK_SIZE = 512 * 1024; // 512KB chunks for Telegram API requests
+
+// Performance optimization
+const CACHE_DURATION = 3600; // 1 hour cache
+const FILE_INFO_CACHE = new Map(); // In-memory cache for file metadata
 
 const ERROR_404 = {"ok":false,"error_code":404,"description":"Bad Request: missing /?file= parameter", "credit": "https://github.com/vauth/filestream-cf"};
 const ERROR_405 = {"ok":false,"error_code":405,"description":"Bad Request: method not allowed"};
@@ -33,20 +38,22 @@ const ERROR_409 = {"ok":false,"error_code":409,"description":"Bad Request: file 
 const ERROR_410 = {"ok":false,"error_code":410,"description":"Bad Request: file size exceeds streaming limit (2GB max)"};
 const ERROR_411 = {"ok":false,"error_code":411,"description":"Bad Request: file not found or deleted"};
 
-// ---------- Event Listener ---------- // 
+// ---------- ES Module Export (Fixes D1 Binding) ---------- // 
 
-addEventListener('fetch', event => {
-    event.respondWith(handleRequest(event))
-});
+export default {
+    async fetch(request, env, ctx) {
+        return handleRequest(request, env, ctx);
+    }
+};
 
-async function handleRequest(event) {
-    const url = new URL(event.request.url);
+async function handleRequest(request, env, ctx) {
+    const url = new URL(request.url);
     const path = url.pathname;
     
     // Bot webhook endpoints
-    if (path === BOT_WEBHOOK) {return Bot.handleWebhook(event)}
-    if (path === '/registerWebhook') {return Bot.registerWebhook(event, url, BOT_WEBHOOK, BOT_SECRET)}
-    if (path === '/unregisterWebhook') {return Bot.unregisterWebhook(event)}
+    if (path === BOT_WEBHOOK) {return Bot.handleWebhook(request, env)}
+    if (path === '/registerWebhook') {return Bot.registerWebhook(request, url, BOT_WEBHOOK, BOT_SECRET)}
+    if (path === '/unregisterWebhook') {return Bot.unregisterWebhook(request)}
     if (path === '/getMe') {return new Response(JSON.stringify(await Bot.getMe()), {headers: HEADERS_ERRR, status: 202})}
     
     // New URL structure: /stream/FileID or /dl/FileID
@@ -69,17 +76,22 @@ async function handleRequest(event) {
     
     // Home page (only if no file is requested)
     if (path === '/' && !file) {
-        return new Response(await getHomePage(), {headers: {'Content-Type': 'text/html'}})
+        return new Response(await getHomePage(), {
+            headers: {
+                'Content-Type': 'text/html; charset=utf-8',
+                'Cache-Control': `public, max-age=${CACHE_DURATION}`
+            }
+        })
     }
     
     // Streaming page with player
     if (path === '/streampage' && file) {
-        return new Response(await getStreamPage(url, file), {headers: {'Content-Type': 'text/html'}})
+        return new Response(await getStreamPage(url, file, env), {headers: {'Content-Type': 'text/html; charset=utf-8'}})
     }
 
     if (!file) {return Raise(ERROR_404, 404);}
     if (!["attachment", "inline", "stream"].includes(mode)) {return Raise(ERROR_408, 404)}
-    if (!WHITE_METHODS.includes(event.request.method)) {return Raise(ERROR_405, 405);}
+    if (!WHITE_METHODS.includes(request.method)) {return Raise(ERROR_405, 405);}
     
     try {await Cryptic.deHash(file)} catch {return Raise(ERROR_407, 404)}
 
@@ -87,18 +99,18 @@ async function handleRequest(event) {
     const file_id = await Cryptic.deHash(file);
     
     // Check if file exists in database
-    if (event.env && event.env.DB) {
-        const fileExists = await DB.getFile(event.env.DB, file_id);
+    if (env && env.DB) {
+        const fileExists = await DB.getFile(env.DB, file_id);
         if (!fileExists) {
             return Raise(ERROR_411, 404);
         }
         
-        // Update stats
-        await DB.incrementDownloads(event.env.DB, file_id);
+        // Update stats asynchronously (non-blocking)
+        ctx.waitUntil(DB.incrementDownloads(env.DB, file_id));
     }
     
-    // Validate file size before retrieving
-    const fileInfo = await getFileInfo(channel_id, file_id);
+    // Validate file size before retrieving (with caching for performance)
+    const fileInfo = await getFileInfoCached(channel_id, file_id);
     if (fileInfo.error_code) {return await Raise(fileInfo, fileInfo.error_code)};
     
     const fSize = fileInfo.size;
@@ -112,25 +124,28 @@ async function handleRequest(event) {
     const retrieve = await RetrieveFile(channel_id, file_id);
     if (retrieve.error_code) {return await Raise(retrieve, retrieve.error_code)};
 
-    const rdata = retrieve[0]
+    const rpath = retrieve[0]
     const rname = retrieve[1]
     const rsize = retrieve[2]
     const rtype = retrieve[3]
 
-    // Handle range requests for streaming
-    const range = event.request.headers.get('Range');
-    if (range && (mode === 'inline' || mode === 'stream')) {
-        return handleRangeRequest(rdata, rname, rsize, rtype, range);
-    }
-
-    return new Response(rdata, {
-        status: 200, headers: {
-            "Content-Disposition": `${mode === 'stream' ? 'inline' : mode}; filename=${rname}`,
-            "Content-Length": rsize,
-            "Content-Type": rtype,
-            "Accept-Ranges": "bytes",
-            ...HEADERS_FILE
-        }
+    // Stream the file directly from Telegram without loading into memory
+    const range = request.headers.get('Range');
+    const telegramResponse = await streamFileFromTelegram(rpath, range);
+    
+    // Clone the response and modify headers
+    const headers = new Headers(telegramResponse.headers);
+    headers.set("Content-Disposition", `${mode === 'stream' ? 'inline' : mode}; filename=${rname}`);
+    headers.set("Content-Type", rtype);
+    headers.set("Accept-Ranges", "bytes");
+    headers.set("Access-Control-Allow-Origin", "*");
+    headers.set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
+    headers.set("Access-Control-Allow-Headers", "Content-Type");
+    headers.set("Cache-Control", "public, max-age=3600");
+    
+    return new Response(telegramResponse.body, {
+        status: telegramResponse.status,
+        headers: headers
     });
 }
 
@@ -363,6 +378,41 @@ async function getFileInfo(channel_id, message_id) {
     return {size: fSize, type: fType};
 }
 
+// ---------- Cached File Info (Performance Optimization) ---------- //
+
+async function getFileInfoCached(channel_id, message_id) {
+    const cacheKey = `${channel_id}:${message_id}`;
+    const now = Date.now();
+    
+    // Check cache
+    if (FILE_INFO_CACHE.has(cacheKey)) {
+        const cached = FILE_INFO_CACHE.get(cacheKey);
+        if (now - cached.timestamp < CACHE_DURATION * 1000) {
+            return cached.data;
+        }
+        FILE_INFO_CACHE.delete(cacheKey);
+    }
+    
+    // Fetch fresh data
+    const fileInfo = await getFileInfo(channel_id, message_id);
+    
+    // Cache successful responses
+    if (!fileInfo.error_code) {
+        FILE_INFO_CACHE.set(cacheKey, {
+            data: fileInfo,
+            timestamp: now
+        });
+        
+        // Cleanup old cache entries (keep max 1000 entries)
+        if (FILE_INFO_CACHE.size > 1000) {
+            const firstKey = FILE_INFO_CACHE.keys().next().value;
+            FILE_INFO_CACHE.delete(firstKey);
+        }
+    }
+    
+    return fileInfo;
+}
+
 // ---------- Retrieve File ---------- //
 
 async function RetrieveFile(channel_id, message_id) {
@@ -401,7 +451,23 @@ async function RetrieveFile(channel_id, message_id) {
     const file = await Bot.getFile(fID)
     if (file.error_code){return file}
 
-    return [await Bot.fetchFile(file.file_path), fName, fSize, fType];
+    // Return file info instead of full file data for streaming
+    return [file.file_path, fName, fSize, fType];
+}
+
+// ---------- Stream File from Telegram ---------- //
+
+async function streamFileFromTelegram(filePath, rangeHeader) {
+    const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+    
+    // Forward the range request to Telegram
+    const headers = {};
+    if (rangeHeader) {
+        headers['Range'] = rangeHeader;
+    }
+    
+    const response = await fetch(fileUrl, { headers });
+    return response;
 }
 
 // ---------- Raise Error ---------- //
@@ -410,43 +476,12 @@ async function Raise(json_error, status_code) {
     return new Response(JSON.stringify(json_error), { headers: HEADERS_ERRR, status: status_code });
 }
 
-// ---------- Range Request Handler ---------- //
-
-function handleRangeRequest(data, name, size, type, rangeHeader) {
-    try {
-        const parts = rangeHeader.replace(/bytes=/, "").split("-");
-        const start = parseInt(parts[0], 10) || 0;
-        const end = parts[1] ? parseInt(parts[1], 10) : Math.min(start + CHUNK_SIZE - 1, size - 1);
-        
-        if (start >= size || end >= size || start > end) {
-            return new Response(JSON.stringify({
-                ok: false, error_code: 416, description: "Range Not Satisfiable"
-            }), { status: 416, headers: { "Content-Range": `bytes */${size}`, ...HEADERS_ERRR } });
-        }
-        
-        const chunksize = (end - start) + 1;
-        const buffer = new Uint8Array(data);
-        const chunk = buffer.slice(start, end + 1);
-        
-        return new Response(chunk, {
-            status: 206,
-            headers: {
-                "Content-Range": `bytes ${start}-${end}/${size}`,
-                "Accept-Ranges": "bytes",
-                "Content-Length": chunksize.toString(),
-                "Content-Type": type,
-                "Cache-Control": "public, max-age=86400",
-                ...HEADERS_FILE
-            }
-        });
-    } catch (error) {
-        return new Response(JSON.stringify({ok: false, error_code: 500, description: "Internal Server Error"}), {status: 500, headers: HEADERS_ERRR});
-    }
-}
+// ---------- Range Request Handler (Legacy - not used anymore) ---------- //
+// Now using direct streaming from Telegram API
 
 // ---------- Stream Page Generator ---------- //
 
-async function getStreamPage(url, fileHash) {
+async function getStreamPage(url, fileHash, env) {
     const bot = await Bot.getMe();
     const streamUrl = `${url.origin}/stream/${fileHash}`;
     const downloadUrl = `${url.origin}/dl/${fileHash}`;
@@ -455,25 +490,41 @@ async function getStreamPage(url, fileHash) {
     let fileName = 'Media File';
     let fileType = 'video';
     let fileSize = 0;
+    let downloads = 0;
     
     try {
         const channel_id = BOT_CHANNEL;
         const file_id = await Cryptic.deHash(fileHash);
-        const data = await Bot.editMessage(channel_id, file_id, await UUID());
-         
-        if (data.document) {
-            fileName = data.document.file_name;
-            fileSize = data.document.file_size;
-            fileType = data.document.mime_type.startsWith('video') ? 'video' : 
-                      data.document.mime_type.startsWith('audio') ? 'audio' : 'document';
-        } else if (data.video) {
-            fileName = data.video.file_name || 'Video File';
-            fileSize = data.video.file_size;
-            fileType = 'video';
-        } else if (data.audio) {
-            fileName = data.audio.file_name || 'Audio File';
-            fileSize = data.audio.file_size;
-            fileType = 'audio';
+        
+        // Get file data from DB if available
+        if (env && env.DB) {
+            const fileData = await DB.getFile(env.DB, file_id);
+            if (fileData) {
+                fileName = fileData.file_name;
+                fileSize = fileData.file_size;
+                fileType = fileData.file_type;
+                downloads = fileData.downloads || 0;
+            }
+        }
+        
+        // Fallback to Telegram API if DB not available
+        if (!fileName || fileName === 'Media File') {
+            const data = await Bot.editMessage(channel_id, file_id, await UUID());
+            
+            if (data.document) {
+                fileName = data.document.file_name;
+                fileSize = data.document.file_size;
+                fileType = data.document.mime_type.startsWith('video') ? 'video' : 
+                          data.document.mime_type.startsWith('audio') ? 'audio' : 'document';
+            } else if (data.video) {
+                fileName = data.video.file_name || 'Video File';
+                fileSize = data.video.file_size;
+                fileType = 'video';
+            } else if (data.audio) {
+                fileName = data.audio.file_name || 'Audio File';
+                fileSize = data.audio.file_size;
+                fileType = 'audio';
+            }
         }
     } catch (e) {}
      
@@ -493,14 +544,34 @@ async function getStreamPage(url, fileHash) {
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { 
             font-family: 'Poppins', sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%);
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 50%, #7e22ce 100%);
             min-height: 100vh;
             padding: 20px;
             overflow-x: hidden;
+            position: relative;
+        }
+        /* Premium animated background */
+        body::before {
+            content: '';
+            position: fixed;
+            width: 200%;
+            height: 200%;
+            top: -50%;
+            left: -50%;
+            z-index: 0;
+            background: radial-gradient(circle, rgba(255,255,255,0.05) 1px, transparent 1px);
+            background-size: 50px 50px;
+            animation: moveBackground 20s linear infinite;
+        }
+        @keyframes moveBackground {
+            0% { transform: translate(0, 0); }
+            100% { transform: translate(50px, 50px); }
         }
         .container {
             max-width: 1200px;
             margin: 0 auto;
+            position: relative;
+            z-index: 1;
         }
         .header {
             text-align: center;
@@ -511,8 +582,12 @@ async function getStreamPage(url, fileHash) {
         .header h1 {
             font-size: 3em;
             font-weight: 800;
-            text-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            text-shadow: 0 4px 20px rgba(0,0,0,0.5);
             margin-bottom: 10px;
+            background: linear-gradient(135deg, #fff, #e0e7ff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
         }
         .header p {
             font-size: 1.2em;
@@ -520,20 +595,24 @@ async function getStreamPage(url, fileHash) {
             text-shadow: 0 2px 10px rgba(0,0,0,0.2);
         }
         .main-card {
-            background: rgba(255, 255, 255, 0.95);
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(20px) saturate(180%);
+            -webkit-backdrop-filter: blur(20px) saturate(180%);
+            border: 1px solid rgba(255, 255, 255, 0.2);
             border-radius: 30px;
             padding: 40px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            backdrop-filter: blur(10px);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.4), 0 0 80px rgba(126, 34, 206, 0.3);
             animation: fadeInUp 0.8s ease;
         }
         .file-info {
-            background: linear-gradient(135deg, #667eea, #764ba2);
+            background: linear-gradient(135deg, rgba(30, 60, 114, 0.9), rgba(126, 34, 206, 0.9));
+            backdrop-filter: blur(10px);
             border-radius: 20px;
             padding: 30px;
             color: white;
             margin-bottom: 30px;
-            box-shadow: 0 10px 30px rgba(102, 126, 234, 0.4);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+            border: 1px solid rgba(255, 255, 255, 0.1);
         }
         .file-info h2 {
             font-size: 1.8em;
@@ -552,12 +631,51 @@ async function getStreamPage(url, fileHash) {
             border-radius: 20px;
             overflow: hidden;
             margin-bottom: 30px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+            box-shadow: 0 15px 50px rgba(0,0,0,0.6);
+            border: 2px solid rgba(255, 255, 255, 0.1);
+            position: relative;
+        }
+        .player-container::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(45deg, rgba(126, 34, 206, 0.1), transparent);
+            pointer-events: none;
         }
         video, audio {
             width: 100%;
             display: block;
             outline: none;
+            position: relative;
+            z-index: 1;
+        }
+        .stats-bar {
+            display: flex;
+            justify-content: space-around;
+            padding: 20px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            margin-bottom: 20px;
+            backdrop-filter: blur(10px);
+        }
+        .stat-item {
+            text-align: center;
+            color: white;
+        }
+        .stat-number {
+            font-size: 1.5em;
+            font-weight: 700;
+            display: block;
+            margin-bottom: 5px;
+        }
+        .stat-label {
+            font-size: 0.85em;
+            opacity: 0.8;
+            text-transform: uppercase;
+            letter-spacing: 1px;
         }
         .buttons-grid {
             display: grid;
@@ -571,8 +689,9 @@ async function getStreamPage(url, fileHash) {
             text-decoration: none;
             color: white;
             font-weight: 600;
+            font-variant: small-caps;
             text-align: center;
-            transition: all 0.3s ease;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
             display: flex;
             align-items: center;
             justify-content: center;
@@ -580,28 +699,46 @@ async function getStreamPage(url, fileHash) {
             border: none;
             cursor: pointer;
             font-size: 1em;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+            position: relative;
+            overflow: hidden;
+        }
+        .btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+            transition: left 0.5s;
+        }
+        .btn:hover::before {
+            left: 100%;
         }
         .btn:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 8px 25px rgba(0,0,0,0.3);
+            transform: translateY(-3px) scale(1.02);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.4);
         }
-        .btn-primary { background: linear-gradient(135deg, #667eea, #764ba2); }
-        .btn-success { background: linear-gradient(135deg, #56ab2f, #a8e063); }
-        .btn-info { background: linear-gradient(135deg, #00c6ff, #0072ff); }
-        .btn-warning { background: linear-gradient(135deg, #f2994a, #f2c94c); }
-        .btn-danger { background: linear-gradient(135deg, #eb3349, #f45c43); }
-        .btn-telegram { background: linear-gradient(135deg, #0088cc, #00a5e0); }
+        .btn-primary { background: linear-gradient(135deg, #7e22ce, #9333ea); }
+        .btn-success { background: linear-gradient(135deg, #059669, #10b981); }
+        .btn-info { background: linear-gradient(135deg, #0ea5e9, #06b6d4); }
+        .btn-warning { background: linear-gradient(135deg, #f59e0b, #fbbf24); }
+        .btn-danger { background: linear-gradient(135deg, #dc2626, #ef4444); }
+        .btn-telegram { background: linear-gradient(135deg, #0088cc, #229ED9); }
         .link-box {
-            background: linear-gradient(135deg, #f6f8fb, #e9ecef);
+            background: rgba(255, 255, 255, 0.08);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.15);
             border-radius: 15px;
             padding: 20px;
             margin-bottom: 20px;
         }
         .link-box h3 {
-            color: #667eea;
+            color: #fff;
             margin-bottom: 15px;
             font-size: 1.3em;
+            font-weight: 600;
         }
         .link-input-group {
             display: flex;
@@ -610,20 +747,22 @@ async function getStreamPage(url, fileHash) {
         .link-input {
             flex: 1;
             padding: 12px 20px;
-            border: 2px solid #e0e0e0;
+            border: 2px solid rgba(255, 255, 255, 0.2);
             border-radius: 10px;
             font-size: 0.95em;
             font-family: 'Courier New', monospace;
-            background: white;
+            background: rgba(0, 0, 0, 0.3);
+            color: #fff;
         }
         .copy-btn {
             padding: 12px 25px;
-            background: linear-gradient(135deg, #667eea, #764ba2);
+            background: linear-gradient(135deg, #7e22ce, #9333ea);
             color: white;
             border: none;
             border-radius: 10px;
             cursor: pointer;
             font-weight: 600;
+            font-variant: small-caps;
             transition: all 0.3s ease;
         }
         .copy-btn:hover {
@@ -676,10 +815,25 @@ async function getStreamPage(url, fileHash) {
                     <i class="fas fa-file-${fileType === 'video' ? 'video' : fileType === 'audio' ? 'audio' : 'alt'}"></i>
                     ${fileName}
                 </h2>
-                <p><i class="fas fa-hdd"></i> Size: ${formatSize(fileSize)}</p>
-                <p><i class="fas fa-tag"></i> Type: ${fileType.toUpperCase()}</p>
-                <p><i class="fas fa-check-circle"></i> Status: Ready to Stream</p>
+                <p><i class="fas fa-hdd"></i> ꜱɪᴢᴇ: ${formatSize(fileSize)}</p>
+                <p><i class="fas fa-tag"></i> ᴛʏᴘᴇ: ${fileType.toUpperCase()}</p>
+                <p><i class="fas fa-check-circle"></i> ꜱᴛᴀᴛᴜꜱ: ʀᴇᴀᴅʏ ᴛᴏ ꜱᴛʀᴇᴀᴍ</p>
             </div>
+            
+            ${downloads > 0 ? `<div class="stats-bar">
+                <div class="stat-item">
+                    <span class="stat-number">${downloads}</span>
+                    <span class="stat-label">ᴅᴏᴡɴʟᴏᴀᴅꜱ</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-number">${formatSize(fileSize)}</span>
+                    <span class="stat-label">ꜱɪᴢᴇ</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-number"><i class="fas fa-check-circle"></i></span>
+                    <span class="stat-label">ᴠᴇʀɪꜰɪᴇᴅ</span>
+                </div>
+            </div>` : ''}
             
             ${fileType === 'video' ? `
             <div class="player-container">
@@ -1225,100 +1379,116 @@ async function UUID() {
     });
 }
 
-// ---------- Hash Generator ---------- //
+// ---------- Secure Hash Generator with HMAC-SHA256 ---------- //
 
 class Cryptic {
-  static async getSalt(length = 16) {
-    const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    let salt = '';
+  // Generate cryptographically secure random token
+  static async generateRandomToken(length = 16) {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    const randomValues = crypto.getRandomValues(new Uint8Array(length));
+    let token = '';
     for (let i = 0; i < length; i++) {
-        salt += characters.charAt(Math.floor(Math.random() * characters.length));
+        token += chars[randomValues[i] % chars.length];
     }
-    return salt;
+    return token;
   }
 
-  static async getKey(salt, iterations = 1000, keyLength = 32) {
-    const key = new Uint8Array(keyLength);
-    for (let i = 0; i < keyLength; i++) {
-        key[i] = (SIA_SECRET.charCodeAt(i % SIA_SECRET.length) + salt.charCodeAt(i % salt.length)) % 256;
-    }
-    for (let j = 0; j < iterations; j++) {
-        for (let i = 0; i < keyLength; i++) {
-            key[i] = (key[i] + SIA_SECRET.charCodeAt(i % SIA_SECRET.length) + salt.charCodeAt(i % salt.length)) % 256;
-        }
-    }
-    return key;
+  // Generate HMAC-SHA256 signature
+  static async hmacSHA256(message, secret) {
+    const encoder = new TextEncoder();
+    const keyData = encoder.encode(secret);
+    const messageData = encoder.encode(message);
+    
+    const key = await crypto.subtle.importKey(
+        'raw',
+        keyData,
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['sign']
+    );
+    
+    const signature = await crypto.subtle.sign('HMAC', key, messageData);
+    return this.arrayBufferToBase64(signature);
   }
 
-  static async baseEncode(input) {
-    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-    let output = '';
-    let buffer = 0;
-    let bitsLeft = 0;
-    for (let i = 0; i < input.length; i++) {
-        buffer = (buffer << 8) | input.charCodeAt(i);
-        bitsLeft += 8;
-        while (bitsLeft >= 5) {output += alphabet[(buffer >> (bitsLeft - 5)) & 31]; bitsLeft -= 5}
+  // Convert ArrayBuffer to Base64
+  static arrayBufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    for (let i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i]);
     }
-    if (bitsLeft > 0) {output += alphabet[(buffer << (5 - bitsLeft)) & 31]}
-    return output;
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
   }
 
-  static async baseDecode(input) {
-    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-    const lookup = {};
-    for (let i = 0; i < alphabet.length; i++) {lookup[alphabet[i]] = i}
-    let buffer = 0;
-    let bitsLeft = 0;
-    let output = '';
-    for (let i = 0; i < input.length; i++) {
-        buffer = (buffer << 5) | lookup[input[i]];
-        bitsLeft += 5;
-        if (bitsLeft >= 8) {output += String.fromCharCode((buffer >> (bitsLeft - 8)) & 255); bitsLeft -= 8}
+  // Convert Base64 to ArrayBuffer
+  static base64ToArrayBuffer(base64) {
+    base64 = base64.replace(/-/g, '+').replace(/_/g, '/');
+    while (base64.length % 4) {
+        base64 += '=';
     }
-    return output;
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes.buffer;
   }
 
+  // Generate secure hash: random_token + message_id + HMAC(random_token:message_id, secret)
   static async Hash(text) {
-    const salt = await this.getSalt();
-    const key = await this.getKey(salt);
-    const encoded = String(text).split('').map((char, index) => {
-        return String.fromCharCode(char.charCodeAt(0) ^ key[index % key.length]);
-    }).join('');
-    return await this.baseEncode(salt + encoded);
+    const randomToken = await this.generateRandomToken(12);
+    const payload = `${randomToken}:${text}`;
+    const signature = await this.hmacSHA256(payload, SIA_SECRET);
+    // Format: randomToken.messageId.signature (URL-safe)
+    return `${randomToken}.${text}.${signature.substring(0, 32)}`;
   }
 
+  // Verify and extract message_id from hash
   static async deHash(hashed) {
-    const decoded = await this.baseDecode(hashed);
-    const salt = decoded.substring(0, 16);
-    const encoded = decoded.substring(16);
-    const key = await this.getKey(salt);
-    const text = encoded.split('').map((char, index) => {
-        return String.fromCharCode(char.charCodeAt(0) ^ key[index % key.length]);
-    }).join('');
-    return text;
+    const parts = hashed.split('.');
+    if (parts.length !== 3) {
+        throw new Error('Invalid hash format');
+    }
+    
+    const randomToken = parts[0];
+    const messageId = parts[1];
+    const providedSignature = parts[2];
+    
+    // Verify HMAC signature
+    const payload = `${randomToken}:${messageId}`;
+    const expectedSignature = (await this.hmacSHA256(payload, SIA_SECRET)).substring(0, 32);
+    
+    if (providedSignature !== expectedSignature) {
+        throw new Error('Invalid signature - hash verification failed');
+    }
+    
+    return messageId;
   }
 }
 
 // ---------- Telegram Bot ---------- //
 
 class Bot {
-  static async handleWebhook(event) {
-    if (event.request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== BOT_SECRET) {
+  static async handleWebhook(request, env) {
+    if (request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== BOT_SECRET) {
       return new Response('Unauthorized', { status: 403 })
     }
-    const update = await event.request.json()
-    event.waitUntil(this.Update(event, update))
+    const update = await request.json()
+    // Process update asynchronously
+    if (update.inline_query) {await onInline(request, env, update.inline_query)}
+    if (update.callback_query) {await onCallback(request, env, update.callback_query)}
+    if ('message' in update) {await onMessage(request, env, update.message)}
     return new Response('Ok')
   }
 
-  static async registerWebhook(event, requestUrl, suffix, secret) {
+  static async registerWebhook(request, requestUrl, suffix, secret) {
     const webhookUrl = `${requestUrl.protocol}//${requestUrl.hostname}${suffix}`
     const response = await fetch(await this.apiUrl('setWebhook', { url: webhookUrl, secret_token: secret }))
     return new Response(JSON.stringify(await response.json()), {headers: HEADERS_ERRR})
   }
 
-  static async unregisterWebhook(event) { 
+  static async unregisterWebhook(request) { 
     const response = await fetch(await this.apiUrl('setWebhook', { url: '' }))
     return new Response(JSON.stringify(await response.json()), {headers: HEADERS_ERRR})
   }
@@ -1430,17 +1600,11 @@ class Bot {
       if (params) {query = '?' + new URLSearchParams(params).toString()}
       return `https://api.telegram.org/bot${BOT_TOKEN}/${methodName}${query}`
   }
-
-  static async Update(event, update) {
-    if (update.inline_query) {await onInline(event, update.inline_query)}
-    if (update.callback_query) {await onCallback(event, update.callback_query)}
-    if ('message' in update) {await onMessage(event, update.message)}
-  }
 }
 
 // ---------- Callback Query Handler ---------- // 
 
-async function onCallback(event, callback) {
+async function onCallback(request, env, callback) {
     const data = callback.data;
     const chatId = callback.message.chat.id;
     const messageId = callback.message.message_id;
@@ -1451,11 +1615,11 @@ async function onCallback(event, callback) {
         const token = data.replace('revoke_', '');
         
         // Check if database is available
-        if (!event.env || !event.env.DB) {
+        if (!env || !env.DB) {
             return Bot.answerCallbackQuery(callback.id, "❌ Database not configured", true);
         }
         
-        const fileData = await DB.getFileByToken(event.env.DB, token);
+        const fileData = await DB.getFileByToken(env.DB, token);
         
         if (!fileData) {
             return Bot.answerCallbackQuery(callback.id, "❌ File not found or already deleted", true);
@@ -1470,7 +1634,7 @@ async function onCallback(event, callback) {
         await Bot.deleteMessage(BOT_CHANNEL, fileData.message_id);
         
         // Delete from database
-        await DB.deleteFile(event.env.DB, fileData.message_id);
+        await DB.deleteFile(env.DB, fileData.message_id);
         
         // Edit the message
         await Bot.editMessageText(chatId, messageId, "🗑️ *ғɪʟᴇ ʀᴇᴠᴏᴋᴇᴅ sᴜᴄᴄᴇssғᴜʟʟʏ!*\n\nAll links have been deleted and the file is no longer accessible.", []);
@@ -1482,18 +1646,18 @@ async function onCallback(event, callback) {
     if (data.startsWith('view_')) {
         const fileId = data.replace('view_', '');
         
-        if (!event.env || !event.env.DB) {
+        if (!env || !env.DB) {
             return Bot.answerCallbackQuery(callback.id, "❌ Database not configured", true);
         }
         
-        const fileData = await DB.getFile(event.env.DB, fileId);
+        const fileData = await DB.getFile(env.DB, fileId);
         
         if (!fileData) {
             return Bot.answerCallbackQuery(callback.id, "❌ File not found", true);
         }
         
         // Generate links
-        const url = new URL(event.request.url);
+        const url = new URL(request.url);
         const final_hash = await Cryptic.Hash(fileData.message_id);
         const stream_page = `${url.origin}/streampage?file=${final_hash}`;
         const stream_link = `${url.origin}/stream/${final_hash}`;
@@ -1535,11 +1699,11 @@ async function onCallback(event, callback) {
     
     // Handle back to files list
     if (data === 'back_to_files') {
-        if (!event.env || !event.env.DB) {
+        if (!env || !env.DB) {
             return Bot.answerCallbackQuery(callback.id, "❌ Database not configured", true);
         }
         
-        const userFiles = await DB.getUserFiles(event.env.DB, userId.toString());
+        const userFiles = await DB.getUserFiles(env.DB, userId.toString());
         
         if (userFiles.length === 0) {
             await Bot.editMessageText(chatId, messageId, "📂 *ʏᴏᴜʀ ғɪʟᴇs*\n\nYou don't have any files yet. Send me a file to get started!", []);
@@ -1562,7 +1726,7 @@ async function onCallback(event, callback) {
 
 // ---------- Inline Listener ---------- // 
 
-async function onInline(event, inline) {
+async function onInline(request, env, inline) {
   let  fID; let fName; let fType; let fSize; let fLen;
 
   if (!PUBLIC_BOT && inline.from.id != BOT_OWNER) {
@@ -1624,9 +1788,9 @@ async function onInline(event, inline) {
 
 // ---------- Message Listener ---------- // 
 
-async function onMessage(event, message) {
+async function onMessage(request, env, message) {
     let fID; let fName; let fSave; let fType; let fSize = 0;
-    let url = new URL(event.request.url);
+    let url = new URL(request.url);
     let bot = await Bot.getMe();
 
     // 1. Ignore messages from the bot itself
@@ -1673,12 +1837,12 @@ async function onMessage(event, message) {
     
     // 4. Handle /files command
     if (message.text === '/files') {
-        if (!event.env || !event.env.DB) {
+        if (!env || !env.DB) {
             return Bot.sendMessage(message.chat.id, message.message_id, "❌ Database not configured. Please set up D1 database.");
         }
         
         const userId = message.from.id.toString();
-        const userFiles = await DB.getUserFiles(event.env.DB, userId);
+        const userFiles = await DB.getUserFiles(env.DB, userId);
         
         if (userFiles.length === 0) {
             return Bot.sendMessage(message.chat.id, message.message_id, "📂 *ʏᴏᴜʀ ғɪʟᴇs*\n\nYou don't have any files yet. Send me a file to get started!");
@@ -1702,11 +1866,11 @@ async function onMessage(event, message) {
             return Bot.sendMessage(message.chat.id, message.message_id, "❌ *ɪɴᴠᴀʟɪᴅ ᴄᴏᴍᴍᴀɴᴅ*\n\nUsage: `/revoke <secret_token>`");
         }
         
-        if (!event.env || !event.env.DB) {
+        if (!env || !env.DB) {
             return Bot.sendMessage(message.chat.id, message.message_id, "❌ Database not configured.");
         }
         
-        const fileData = await DB.getFileByToken(event.env.DB, token);
+        const fileData = await DB.getFileByToken(env.DB, token);
         
         if (!fileData) {
             return Bot.sendMessage(message.chat.id, message.message_id, "❌ *ғɪʟᴇ ɴᴏᴛ ғᴏᴜɴᴅ*\n\nThe file with this token doesn't exist or has already been deleted.");
@@ -1721,7 +1885,7 @@ async function onMessage(event, message) {
         await Bot.deleteMessage(BOT_CHANNEL, fileData.message_id);
         
         // Delete from database
-        await DB.deleteFile(event.env.DB, fileData.message_id);
+        await DB.deleteFile(env.DB, fileData.message_id);
         
         return Bot.sendMessage(message.chat.id, message.message_id, 
             `🗑️ *ғɪʟᴇ ʀᴇᴠᴏᴋᴇᴅ sᴜᴄᴄᴇssғᴜʟʟʏ!*\n\n` +
@@ -1736,12 +1900,12 @@ async function onMessage(event, message) {
             return Bot.sendMessage(message.chat.id, message.message_id, "❌ *ᴘᴇʀᴍɪssɪᴏɴ ᴅᴇɴɪᴇᴅ*\n\nThis command is only available to the bot owner.");
         }
         
-        if (!event.env || !event.env.DB) {
+        if (!env || !env.DB) {
             return Bot.sendMessage(message.chat.id, message.message_id, "❌ Database not configured.");
         }
         
         // Get all files
-        const allFiles = await event.env.DB.prepare('SELECT * FROM files').all();
+        const allFiles = await env.DB.prepare('SELECT * FROM files').all();
         
         if (!allFiles.results || allFiles.results.length === 0) {
             return Bot.sendMessage(message.chat.id, message.message_id, "📂 No files to delete.");
@@ -1757,7 +1921,7 @@ async function onMessage(event, message) {
         }
         
         // Delete all from database
-        await DB.deleteAllFiles(event.env.DB);
+        await DB.deleteAllFiles(env.DB);
         
         return Bot.sendMessage(message.chat.id, message.message_id, 
             `🗑️ *ᴀʟʟ ғɪʟᴇs ᴅᴇʟᴇᴛᴇᴅ!*\n\n` +
@@ -1771,11 +1935,11 @@ async function onMessage(event, message) {
             return Bot.sendMessage(message.chat.id, message.message_id, "❌ *ᴘᴇʀᴍɪssɪᴏɴ ᴅᴇɴɪᴇᴅ*\n\nThis command is only available to the bot owner.");
         }
         
-        if (!event.env || !event.env.DB) {
+        if (!env || !env.DB) {
             return Bot.sendMessage(message.chat.id, message.message_id, "❌ Database not configured.");
         }
         
-        const stats = await DB.getStats(event.env.DB);
+        const stats = await DB.getStats(env.DB);
         
         return Bot.sendMessage(message.chat.id, message.message_id,
             `📊 *ʙᴏᴛ sᴛᴀᴛɪsᴛɪᴄs*\n\n` +
@@ -1856,15 +2020,15 @@ async function onMessage(event, message) {
         const secretToken = await generateSecretToken();
         
         // Save to database if available
-        if (event.env && event.env.DB) {
-            await DB.initDB(event.env.DB);
-            await DB.registerUser(event.env.DB, {
+        if (env && env.DB) {
+            await DB.initDB(env.DB);
+            await DB.registerUser(env.DB, {
                 user_id: message.from.id.toString(),
                 username: message.from.username || '',
                 first_name: message.from.first_name || '',
                 last_name: message.from.last_name || ''
             });
-            await DB.addFile(event.env.DB, {
+            await DB.addFile(env.DB, {
                 file_id: final_hash,
                 message_id: fSave.message_id.toString(),
                 user_id: message.from.id.toString(),
