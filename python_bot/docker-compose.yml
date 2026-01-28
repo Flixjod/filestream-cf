@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: filestream_mongodb
+    restart: always
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: admin_password
+    networks:
+      - filestream_network
+
+  bot:
+    build: .
+    container_name: filestream_bot
+    restart: always
+    depends_on:
+      - mongodb
+    ports:
+      - "8080:8080"
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      API_ID: ${API_ID}
+      API_HASH: ${API_HASH}
+      BOT_OWNER: ${BOT_OWNER}
+      BOT_CHANNEL: ${BOT_CHANNEL}
+      OWNER_USERNAME: ${OWNER_USERNAME}
+      BOT_NAME: ${BOT_NAME}
+      PUBLIC_BOT: ${PUBLIC_BOT}
+      MONGODB_URI: mongodb://admin:admin_password@mongodb:27017
+      DB_NAME: filestream_bot
+      BASE_URL: ${BASE_URL}
+      SECRET_KEY: ${SECRET_KEY}
+      HOST: 0.0.0.0
+      PORT: 8080
+    volumes:
+      - ./sessions:/app/sessions
+    networks:
+      - filestream_network
+
+volumes:
+  mongodb_data:
+
+networks:
+  filestream_network:
+    driver: bridge
