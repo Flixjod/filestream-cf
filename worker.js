@@ -16,14 +16,11 @@ const BOT_NAME = "FileStream Bot"; // Bot Name.
 // ---------- Do Not Modify ---------- // 
 
 const WHITE_METHODS = ["GET", "POST", "HEAD"];
-const HEADERS_FILE = {"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type"};
 const HEADERS_ERRR = {'Access-Control-Allow-Origin': '*', 'content-type': 'application/json'};
 
 // File size limits in bytes
 const MAX_TELEGRAM_SIZE = 4 * 1024 * 1024 * 1024; // 4GB for Telegram/Inline
 const MAX_STREAM_SIZE = 2 * 1024 * 1024 * 1024; // 2GB for direct stream/download
-const CHUNK_SIZE = 1024 * 1024; // 1MB chunks for streaming
-const TELEGRAM_CHUNK_SIZE = 512 * 1024; // 512KB chunks for Telegram API requests
 
 // Performance optimization
 const CACHE_DURATION = 3600; // 1 hour cache
@@ -34,7 +31,6 @@ const ERROR_405 = {"ok":false,"error_code":405,"description":"Bad Request: metho
 const ERROR_406 = {"ok":false,"error_code":406,"description":"Bad Request: file type invalid"};
 const ERROR_407 = {"ok":false,"error_code":407,"description":"Bad Request: file hash invalid by atob"};
 const ERROR_408 = {"ok":false,"error_code":408,"description":"Bad Request: mode not in [attachment, inline, stream]"};
-const ERROR_409 = {"ok":false,"error_code":409,"description":"Bad Request: file size exceeds maximum allowed limit"};
 const ERROR_410 = {"ok":false,"error_code":410,"description":"Bad Request: file size exceeds streaming limit (2GB max)"};
 const ERROR_411 = {"ok":false,"error_code":411,"description":"Bad Request: file not found or deleted"};
 
@@ -530,13 +526,17 @@ async function getStreamPage(url, fileHash, env) {
      
     const vlcUrl = `vlc://${streamUrl.replace('https://', '').replace('http://', '')}`;
     const mxUrl = `intent:${streamUrl}#Intent;package=com.mxtech.videoplayer.ad;end`;
+    
+    // Truncate filename for title if too long (max 50 chars)
+    const truncatedFileName = fileName.length > 50 ? fileName.substring(0, 47) + '...' : fileName;
+    const pageTitle = `Watch ${truncatedFileName} | ${BOT_NAME}`;
      
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${fileName} - ${BOT_NAME}</title>
+    <title>${pageTitle}</title>
     <link rel="icon" type="image/png" href="https://i.ibb.co/pQ0tSCj/1232b12e0a0c.png">
     <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
@@ -647,10 +647,12 @@ async function getStreamPage(url, fileHash, env) {
         }
         video, audio {
             width: 100%;
+            max-height: 70vh;
             display: block;
             outline: none;
             position: relative;
             z-index: 1;
+            background: #000;
         }
         .stats-bar {
             display: flex;
@@ -796,9 +798,24 @@ async function getStreamPage(url, fileHash, env) {
             to { opacity: 1; transform: translateY(0); }
         }
         @media (max-width: 768px) {
-            .header h1 { font-size: 2em; }
-            .main-card { padding: 25px; }
-            .buttons-grid { grid-template-columns: 1fr; }
+            body { padding: 10px; }
+            .header h1 { font-size: 1.8em; }
+            .header p { font-size: 1em; }
+            .main-card { padding: 20px; border-radius: 20px; }
+            .file-info { padding: 20px; }
+            .file-info h2 { font-size: 1.3em; flex-wrap: wrap; }
+            .buttons-grid { grid-template-columns: 1fr; gap: 10px; }
+            .btn { padding: 12px 20px; font-size: 0.95em; }
+            .link-box { padding: 15px; }
+            .link-box h3 { font-size: 1.1em; }
+            .link-input-group { flex-direction: column; }
+            .link-input { font-size: 0.85em; }
+            .stats-bar { flex-direction: column; gap: 15px; padding: 15px; }
+        }
+        @media (max-width: 480px) {
+            .header h1 { font-size: 1.5em; }
+            .file-info h2 { font-size: 1.1em; }
+            .file-info p { font-size: 0.9em; }
         }
     </style>
 </head>
@@ -837,13 +854,13 @@ async function getStreamPage(url, fileHash, env) {
             
             ${fileType === 'video' ? `
             <div class="player-container">
-                <video controls preload="metadata" poster="" controlsList="nodownload">
+                <video controls preload="metadata" playsinline crossorigin="anonymous" controlsList="nodownload">
                     <source src="${streamUrl}" type="video/mp4">
                     Your browser does not support the video tag.
                 </video>
             </div>` : fileType === 'audio' ? `
             <div class="player-container">
-                <audio controls preload="metadata" controlsList="nodownload">
+                <audio controls preload="metadata" crossorigin="anonymous" controlsList="nodownload" style="width: 100%;">
                     <source src="${streamUrl}" type="audio/mpeg">
                     Your browser does not support the audio tag.
                 </audio>
@@ -1530,13 +1547,16 @@ class Bot {
   }
   
   static async copyMessage(chat_id, from_chat_id, message_id, caption='') {
-    const response = await fetch(await this.apiUrl('copyMessage', {
+    const params = {
         chat_id: chat_id, 
         from_chat_id: from_chat_id, 
-        message_id: message_id,
-        caption: caption,
-        parse_mode: 'markdown'
-    }));
+        message_id: message_id
+    };
+    // Only add caption if provided
+    if (caption && caption.trim() !== '') {
+        params.caption = caption;
+    }
+    const response = await fetch(await this.apiUrl('copyMessage', params));
     if (response.status == 200) {return (await response.json()).result;
     } else {return await response.json()}
   }
@@ -1987,11 +2007,15 @@ async function onMessage(request, env, message) {
                 `Please send a smaller file.`);
         }
 
-        // --- 9c. Copy the Message to Channel with Custom Caption ---
-        const userName = message.from.username ? `@${message.from.username}` : message.from.first_name;
-        const customCaption = `RᴇQᴜᴇꜱᴛᴇᴅ ʙʏ : 🍃⏤͟͟͞͞ ${userName}\nUꜱᴇʀ ɪᴅ : ${message.from.id}\nFɪʟᴇ ɴᴀᴍᴇ : ${fName}`;
+        // --- 9c. Copy the Message to Channel (no caption to avoid parsing issues) ---
+        fSave = await Bot.copyMessage(BOT_CHANNEL, message.chat.id, message.message_id, '');
         
-        fSave = await Bot.copyMessage(BOT_CHANNEL, message.chat.id, message.message_id, customCaption);
+        // --- 9d. Send a Reply Message in Channel with User Info ---
+        if (fSave && fSave.message_id) {
+            const userName = message.from.username ? `@${message.from.username}` : message.from.first_name;
+            const userInfoText = `RᴇQᴜᴇꜱᴛᴇᴅ ʙʏ : ${userName}\nUꜱᴇʀ ɪᴅ : ${message.from.id}\nFɪʟᴇ ɴᴀᴍᴇ : ${fName}`;
+            await Bot.sendMessage(BOT_CHANNEL, fSave.message_id, userInfoText, []);
+        }
 
     } else {
         const buttons = [[{ text: "Source Code", url: "https://github.com/vauth/filestream-cf" }]];
